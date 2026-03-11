@@ -74,6 +74,7 @@ class AnalysisResult:
     range_mm: int
     range_label: str
     total_repeats: int
+    equipment_type: str  # "iso" or "dw"
 
     # Per-position results using ALL repeats
     all_positions: dict[str, PositionResult]
@@ -90,9 +91,24 @@ class AnalysisResult:
     max_rep_max: float = 0.0
     mean_opm_max: float = 0.0
 
-    # Spec judgment
+    # Spec judgment — OPM Repeatability (Rep. 1σ)
     spec_limit: Optional[float] = None
     spec_pass: Optional[bool] = None
+    spec_value: Optional[float] = None  # actual measured value used for judgment
+
+    # Spec judgment — Max OPM
+    spec_opm_limit: Optional[float] = None
+    spec_opm_pass: Optional[bool] = None
+    spec_opm_value: Optional[float] = None  # actual measured value used for judgment
+
+    @property
+    def overall_pass(self) -> Optional[bool]:
+        """Both specs must pass for overall PASS."""
+        if self.spec_pass is None and self.spec_opm_pass is None:
+            return None
+        rep_ok = self.spec_pass if self.spec_pass is not None else True
+        opm_ok = self.spec_opm_pass if self.spec_opm_pass is not None else True
+        return rep_ok and opm_ok
 
     @property
     def rms_rep_max(self) -> float:
@@ -174,12 +190,14 @@ def _evaluate_window(recipe: RecipeData, start: int, count: int) -> Optional[Win
     )
 
 
-def analyze_recipe(recipe: RecipeData, window_size: int = 5) -> AnalysisResult:
+def analyze_recipe(recipe: RecipeData, window_size: int = 5,
+                   equipment_type: str = "iso") -> AnalysisResult:
     """Perform full OPM Repeatability analysis on a recipe.
 
     Args:
         recipe: RecipeData with loaded profiles.
         window_size: Number of consecutive repeats for Best-5 window.
+        equipment_type: Equipment type - "iso" (Isolated AE / 분리형) or "dw" (Double Walled AE / 일체형).
 
     Returns:
         AnalysisResult with per-position stats, Best-5 window, and spec judgment.
@@ -223,16 +241,45 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5) -> AnalysisResult:
 
     # --- Spec judgment ---
     range_mm = recipe.range_mm
+    source = best_window.positions if best_window else all_positions
+
+    # 1) OPM Repeatability spec (Rep. 1σ)
     spec_limit = SPEC_REPEATABILITY.get(range_mm)
     spec_pass = None
-    if spec_limit is not None and best_window is not None:
-        # Spec is based on Rep. 1σ Mean from the best window
-        spec_pass = best_window.mean_rep_1sigma <= spec_limit
+    spec_value = None
+    if spec_limit is not None and source:
+        if equipment_type == "dw":
+            # 일체형: Center(5_CM) Rep. 1σ 값
+            center = source.get("5_CM")
+            spec_value = center.rep_1sigma if center else None
+        else:
+            # 분리형: Total RMS of Rep. 1σ across all positions
+            sigmas = [p.rep_1sigma for p in source.values()]
+            spec_value = float(np.sqrt(np.mean(np.array(sigmas) ** 2))) if sigmas else None
+        if spec_value is not None:
+            spec_pass = spec_value <= spec_limit
+
+    # 2) Max OPM spec
+    opm_spec_table = SPEC_MAX_OPM_DW if equipment_type == "dw" else SPEC_MAX_OPM_ISO
+    spec_opm_limit = opm_spec_table.get(range_mm)
+    spec_opm_pass = None
+    spec_opm_value = None
+    if spec_opm_limit is not None and source:
+        if equipment_type == "dw":
+            # 일체형: Center(5_CM) OPM Max 값
+            center = source.get("5_CM")
+            spec_opm_value = center.opm_max if center else None
+        else:
+            # 분리형: Total Max of OPM Max across all positions
+            spec_opm_value = float(max(p.opm_max for p in source.values()))
+        if spec_opm_value is not None:
+            spec_opm_pass = spec_opm_value <= spec_opm_limit
 
     return AnalysisResult(
         range_mm=range_mm,
         range_label=recipe.range_label,
         total_repeats=n_repeats,
+        equipment_type=equipment_type,
         all_positions=all_positions,
         best_window=best_window,
         all_windows=all_windows,
@@ -242,6 +289,10 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5) -> AnalysisResult:
         mean_opm_max=mean_opm_max,
         spec_limit=spec_limit,
         spec_pass=spec_pass,
+        spec_value=spec_value,
+        spec_opm_limit=spec_opm_limit,
+        spec_opm_pass=spec_opm_pass,
+        spec_opm_value=spec_opm_value,
     )
 
 

@@ -216,7 +216,7 @@ def create_wafer_map_figure(result: AnalysisResult,
     cbar.ax.tick_params(colors=COLORS["fg"])
     cbar.set_label("nm", color=COLORS["fg"])
 
-    fig.tight_layout()
+    fig.tight_layout(pad=2.0)
     return fig
 
 

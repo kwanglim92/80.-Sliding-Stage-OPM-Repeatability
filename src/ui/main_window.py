@@ -32,7 +32,7 @@ import numpy as np
 
 from ..core.data_loader import (
     load_recipe, load_dataset, DataSet, RecipeData, POSITION_LABELS,
-    _detect_range_mm,
+    POSITION_GRID, _detect_range_mm,
 )
 from ..core.analyzer import analyze_recipe, AnalysisResult, get_summary_table
 from ..core.flatten import FlattenProcessor
@@ -1064,6 +1064,31 @@ class MainWindow(QMainWindow):
             return
         fig = create_profile_overlay_figure(self.current_recipe, figsize=(12, 9))
         self._update_canvas(self.profile_canvas, fig)
+
+        # Store axes → position mapping for double-click
+        self._profile_axes_map = {}
+        axes = fig.get_axes()
+        for pos in POSITION_LABELS:
+            r, c = POSITION_GRID[pos]
+            idx = r * 3 + c
+            if idx < len(axes):
+                self._profile_axes_map[id(axes[idx])] = pos
+
+        # Connect double-click (reconnect each time figure is replaced)
+        self.profile_canvas.mpl_connect('button_press_event', self._on_profile_dblclick)
+
+    def _on_profile_dblclick(self, event):
+        """Open Position Detail Dialog on double-click."""
+        if not event.dblclick or event.inaxes is None:
+            return
+        if not hasattr(self, '_profile_axes_map'):
+            return
+        pos = self._profile_axes_map.get(id(event.inaxes))
+        if pos and self.current_recipe:
+            from .position_detail_dialog import PositionDetailDialog
+            dlg = PositionDetailDialog(
+                pos, self.current_recipe, self.current_result, parent=self)
+            dlg.exec()
 
     def _update_trend_chart(self):
         if not self.current_result:

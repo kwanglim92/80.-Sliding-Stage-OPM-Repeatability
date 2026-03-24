@@ -37,6 +37,10 @@ from ..core.data_loader import (
 from ..core.analyzer import analyze_recipe, AnalysisResult, get_summary_table
 from ..core.flatten import FlattenProcessor
 from ..core.time_analysis import extract_recipe_timing, RecipeTiming, format_timing_summary
+from ..core.ball_screw_analyzer import (
+    analyze_ball_screw, BallScrewAnalysisResult, get_dishing_matrix,
+    SPEC_DISHING, POSITION_LABELS as BS_POSITION_LABELS,
+)
 from ..visualization.plot_manager import (
     create_profile_overlay_figure,
     create_flatten_preview_figure,
@@ -46,6 +50,7 @@ from ..visualization.plot_manager import (
 )
 from ..visualization.report_generator import (
     export_summary_csv, export_avg_line_csv, export_all_lines_csv, export_checklist,
+    export_ball_screw_csv,
 )
 
 # --- Style ---
@@ -149,6 +154,7 @@ class MainWindow(QMainWindow):
         self.current_recipe: Optional[RecipeData] = None
         self.current_result: Optional[AnalysisResult] = None
         self.current_timing: Optional[RecipeTiming] = None
+        self.current_bs_result: Optional[BallScrewAnalysisResult] = None
         self.flatten_proc = FlattenProcessor()
         self._worker: Optional[LoadWorker] = None
         self._loaded_path: Optional[str] = None
@@ -198,6 +204,10 @@ class MainWindow(QMainWindow):
 
         self.time_widget = self._create_time_tab()
         self.tabs.addTab(self.time_widget, "Time Analysis")
+
+        # Ball Screw Pitch tab
+        self.bs_widget = self._create_ball_screw_tab()
+        self.tabs.addTab(self.bs_widget, "Ball Screw Pitch")
 
         # Remark tab (Export + notes)
         self.remark_widget = self._create_remark_tab()
@@ -554,6 +564,70 @@ class MainWindow(QMainWindow):
         """)
         self.time_table.verticalHeader().setDefaultSectionSize(30)
         layout.addWidget(self.time_table)
+
+        return widget
+
+    def _create_ball_screw_tab(self) -> QWidget:
+        """Ball Screw Pitch analysis tab."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # ── Controls row ─────────────────────────────────────────────────────
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        ctrl_row.addWidget(QLabel("Material:"))
+        self.bs_material_combo = QComboBox()
+        self.bs_material_combo.addItems(["AL (≤6.0 nm)", "SUS (≤4.5 nm)"])
+        self.bs_material_combo.setFixedWidth(130)
+        ctrl_row.addWidget(self.bs_material_combo)
+
+        from PySide6.QtWidgets import QCheckBox
+        self.bs_show_stab_check = QCheckBox("안정화 포인트 표시")
+        self.bs_show_stab_check.setChecked(False)
+        self.bs_show_stab_check.stateChanged.connect(self._on_bs_filter_changed)
+        ctrl_row.addWidget(self.bs_show_stab_check)
+
+        self.bs_analyze_btn = QPushButton("Analyze")
+        self.bs_analyze_btn.setStyleSheet(
+            "background-color: #40a02b; color: white; font-weight: bold; padding: 4px 14px;")
+        self.bs_analyze_btn.clicked.connect(self._on_bs_analyze)
+        ctrl_row.addWidget(self.bs_analyze_btn)
+
+        # Verdict badge
+        self.bs_verdict_label = QLabel("—")
+        self.bs_verdict_label.setAlignment(Qt.AlignCenter)
+        self.bs_verdict_label.setFixedWidth(80)
+        self.bs_verdict_label.setStyleSheet(
+            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "border-radius: 6px; padding: 4px; color: #a6adc8;")
+        ctrl_row.addWidget(self.bs_verdict_label)
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        # ── Plot area: bar chart (left) + heatmap (right) ────────────────────
+        plot_row = QHBoxLayout()
+        self.bs_bar_canvas = FigureCanvas(Figure(figsize=(8, 4)))
+        self.bs_heatmap_canvas = FigureCanvas(Figure(figsize=(6, 4)))
+        plot_row.addWidget(self.bs_bar_canvas, 6)
+        plot_row.addWidget(self.bs_heatmap_canvas, 4)
+        layout.addLayout(plot_row)
+
+        # ── Summary table ────────────────────────────────────────────────────
+        self.bs_table = QTableWidget()
+        self.bs_table.setMinimumHeight(180)
+        self.bs_table.setMaximumHeight(220)
+        self.bs_table.setStyleSheet("""
+            QTableWidget { font-size: 12px; }
+            QTableWidget::item { padding: 4px; }
+            QHeaderView::section { font-size: 12px; padding: 6px;
+                background-color: #313244; color: #89b4fa;
+                border: 1px solid #45475a; font-weight: bold; }
+        """)
+        self.bs_table.verticalHeader().setDefaultSectionSize(26)
+        layout.addWidget(self.bs_table)
 
         return widget
 
@@ -947,6 +1021,9 @@ class MainWindow(QMainWindow):
         self._update_wafer_map()
         self._update_best5_chart()
         self._update_time_tab()
+        # Reset Ball Screw result when recipe changes (requires explicit Analyze click)
+        self.current_bs_result = None
+        self._clear_bs_tab()
 
         self.export_btn.setEnabled(True)
 
@@ -1166,6 +1243,202 @@ class MainWindow(QMainWindow):
         est = self.current_timing.estimate_duration(n)
         self.time_est_result.setText(est)
 
+    # ─── Ball Screw Pitch ─────────────────────────────────────
+
+    def _on_bs_analyze(self):
+        """Run Ball Screw Pitch analysis on current recipe."""
+        if not self.current_recipe:
+            QMessageBox.warning(self, "Warning", "Load data first.")
+            return
+
+        material_text = self.bs_material_combo.currentText()
+        material = "AL" if material_text.startswith("AL") else "SUS"
+        signal_source = self.source_combo.currentText()
+
+        try:
+            self.current_bs_result = analyze_ball_screw(
+                self.current_recipe, signal_source=signal_source, material=material)
+            self._update_bs_tab()
+        except Exception as e:
+            QMessageBox.critical(self, "Ball Screw Analysis Error", str(e))
+
+    def _on_bs_filter_changed(self):
+        """Toggle stabilization point display."""
+        if self.current_bs_result:
+            self._update_bs_tab()
+
+    def _clear_bs_tab(self):
+        """Reset Ball Screw tab to empty state."""
+        self.bs_verdict_label.setText("—")
+        self.bs_verdict_label.setStyleSheet(
+            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "border-radius: 6px; padding: 4px; color: #a6adc8;")
+        self.bs_table.clear()
+        self.bs_table.setRowCount(0)
+        self.bs_table.setColumnCount(0)
+        for canvas in (self.bs_bar_canvas, self.bs_heatmap_canvas):
+            old = canvas.figure
+            new_fig = Figure(figsize=old.get_size_inches())
+            plt.close(old)
+            self._update_canvas(canvas, new_fig)
+
+    def _update_bs_tab(self):
+        """Refresh all Ball Screw tab visuals from current_bs_result."""
+        if not self.current_bs_result:
+            return
+        bs = self.current_bs_result
+        include_stab = self.bs_show_stab_check.isChecked()
+
+        # ── Verdict badge ────────────────────────────────────────────────────
+        if bs.overall_pass:
+            self.bs_verdict_label.setText("PASS")
+            self.bs_verdict_label.setStyleSheet(
+                "font-size: 16px; font-weight: bold; border: 2px solid #a6e3a1;"
+                "border-radius: 6px; padding: 4px; color: #a6e3a1;")
+        else:
+            self.bs_verdict_label.setText("FAIL")
+            self.bs_verdict_label.setStyleSheet(
+                "font-size: 16px; font-weight: bold; border: 2px solid #f38ba8;"
+                "border-radius: 6px; padding: 4px; color: #f38ba8;")
+
+        positions, rep_labels, dishing_matrix = get_dishing_matrix(
+            bs, include_stabilization=include_stab)
+        spec_limit = bs.spec_limit
+        n_pos = len(positions)
+        n_rep = len(rep_labels)
+
+        # ── Bar chart ────────────────────────────────────────────────────────
+        bar_fig = Figure(figsize=(8, 4), facecolor="#1e1e2e")
+        ax = bar_fig.add_subplot(111, facecolor="#181825")
+
+        x_pos = np.arange(n_pos)
+        bar_w = 0.6
+        colors_rep = plt.cm.tab10(np.linspace(0, 0.9, max(n_rep, 1)))
+
+        # Scatter individual repeat values
+        for rep_i in range(n_rep):
+            vals = dishing_matrix[:, rep_i]
+            ax.scatter(x_pos, vals, color=colors_rep[rep_i], s=40, zorder=5,
+                       label=rep_labels[rep_i], alpha=0.85)
+
+        # Mean bars
+        means = np.nanmean(dishing_matrix, axis=1)
+        bar_colors = ["#f38ba8" if v > spec_limit else "#89b4fa" for v in means]
+        ax.bar(x_pos, means, width=bar_w, color=bar_colors, alpha=0.35, zorder=3)
+
+        # Spec line
+        ax.axhline(spec_limit, color="#f38ba8", linewidth=1.5, linestyle="--",
+                   label=f"Spec ({spec_limit} nm)")
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(positions, rotation=25, ha="right",
+                           color="#cdd6f4", fontsize=9)
+        ax.set_ylabel("Dishing (nm)", color="#cdd6f4", fontsize=10)
+        ax.set_title(f"Ball Screw Pitch — Dishing per Position [{bs.material}, ≤{spec_limit} nm]",
+                     color="#89b4fa", fontsize=11, pad=8)
+        ax.tick_params(colors="#cdd6f4", labelsize=9)
+        ax.spines[:].set_color("#45475a")
+        legend = ax.legend(loc="upper right", fontsize=8,
+                           facecolor="#313244", edgecolor="#45475a",
+                           labelcolor="#cdd6f4", framealpha=0.85)
+        ax.grid(axis="y", color="#313244", linewidth=0.5)
+        bar_fig.tight_layout(pad=1.2)
+        self._update_canvas(self.bs_bar_canvas, bar_fig)
+
+        # ── Heatmap ──────────────────────────────────────────────────────────
+        hm_fig = Figure(figsize=(6, 4), facecolor="#1e1e2e")
+        ax2 = hm_fig.add_subplot(111, facecolor="#181825")
+
+        import matplotlib.colors as mcolors
+        vmax = max(float(np.nanmax(dishing_matrix)), spec_limit * 1.1)
+        vmin = 0.0
+        cmap = plt.cm.RdYlGn_r
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+        im = ax2.imshow(dishing_matrix.T, aspect="auto", cmap=cmap, norm=norm,
+                        origin="upper")
+        ax2.set_xticks(range(n_pos))
+        ax2.set_xticklabels(positions, rotation=30, ha="right",
+                            color="#cdd6f4", fontsize=8)
+        ax2.set_yticks(range(n_rep))
+        ax2.set_yticklabels(rep_labels, color="#cdd6f4", fontsize=8)
+        ax2.tick_params(colors="#cdd6f4")
+        ax2.set_title("Dishing Heatmap\n(Position × Repeat)",
+                      color="#89b4fa", fontsize=10, pad=6)
+        ax2.spines[:].set_color("#45475a")
+
+        # Annotate values + highlight spec failure
+        for pos_i in range(n_pos):
+            for rep_i in range(n_rep):
+                val = dishing_matrix[pos_i, rep_i]
+                if not np.isnan(val):
+                    txt_color = "white" if val > spec_limit * 0.7 else "black"
+                    ax2.text(pos_i, rep_i, f"{val:.2f}",
+                             ha="center", va="center",
+                             color=txt_color, fontsize=7.5, fontweight="bold")
+                    if val > spec_limit:
+                        ax2.add_patch(plt.Rectangle(
+                            (pos_i - 0.5, rep_i - 0.5), 1, 1,
+                            fill=False, edgecolor="#f38ba8", linewidth=2))
+
+        cb = hm_fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+        cb.ax.yaxis.set_tick_params(color="#cdd6f4")
+        cb.ax.tick_params(labelcolor="#cdd6f4", labelsize=8)
+        cb.set_label("Dishing (nm)", color="#cdd6f4", fontsize=9)
+        hm_fig.tight_layout(pad=1.2)
+        self._update_canvas(self.bs_heatmap_canvas, hm_fig)
+
+        # ── Summary Table ────────────────────────────────────────────────────
+        stat_cols = ["Position"] + rep_labels + ["Mean", "Stdev", "Max", "Spec"]
+        self.bs_table.setColumnCount(len(stat_cols))
+        self.bs_table.setHorizontalHeaderLabels(stat_cols)
+        self.bs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.bs_table.setRowCount(n_pos)
+        for row_i, pos in enumerate(positions):
+            vals = dishing_matrix[row_i, :]
+            valid_vals = vals[~np.isnan(vals)]
+            mean_v = float(np.mean(valid_vals)) if len(valid_vals) else float("nan")
+            std_v = float(np.std(valid_vals, ddof=0)) if len(valid_vals) else float("nan")
+            max_v = float(np.max(valid_vals)) if len(valid_vals) else float("nan")
+            is_stab = pos == "1_LT_stab"
+            spec_txt = "N/A" if is_stab else ("PASS" if max_v <= spec_limit else "FAIL")
+
+            row_data = [pos]
+            for rep_i in range(n_rep):
+                v = vals[rep_i]
+                row_data.append(f"{v:.3f}" if not np.isnan(v) else "—")
+            row_data += [
+                f"{mean_v:.3f}" if not np.isnan(mean_v) else "—",
+                f"{std_v:.3f}" if not np.isnan(std_v) else "—",
+                f"{max_v:.3f}" if not np.isnan(max_v) else "—",
+                spec_txt,
+            ]
+
+            for col_i, cell_val in enumerate(row_data):
+                item = QTableWidgetItem(cell_val)
+                item.setTextAlignment(Qt.AlignCenter)
+                # Color based on context
+                if col_i == 0:  # Position label
+                    if is_stab:
+                        item.setForeground(QColor("#a6adc8"))
+                elif col_i == len(row_data) - 1:  # Spec column
+                    if spec_txt == "FAIL":
+                        item.setForeground(QColor("#f38ba8"))
+                        item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                    elif spec_txt == "PASS":
+                        item.setForeground(QColor("#a6e3a1"))
+                else:  # Value cells
+                    try:
+                        fval = float(cell_val)
+                        if not is_stab and fval > spec_limit:
+                            item.setForeground(QColor("#f38ba8"))
+                        elif not is_stab and fval <= spec_limit * 0.8:
+                            item.setForeground(QColor("#a6e3a1"))
+                    except (ValueError, TypeError):
+                        pass
+                self.bs_table.setItem(row_i, col_i, item)
+
     # ─── Flatten ─────────────────────────────────────────────
 
     def _on_flatten_execute(self):
@@ -1238,6 +1511,16 @@ class MainWindow(QMainWindow):
                                   ("best5", self.best5_canvas)]:
                 canvas.figure.savefig(str(base / f"{name}_{rl}.png"), dpi=150,
                                       facecolor="#1e1e2e", bbox_inches="tight")
+
+            # Ball Screw export (only if analysis has been run)
+            if self.current_bs_result:
+                include_stab = self.bs_show_stab_check.isChecked()
+                export_ball_screw_csv(self.current_bs_result, base, include_stab)
+                # Save chart images
+                for name, canvas in [("bs_bar", self.bs_bar_canvas),
+                                     ("bs_heatmap", self.bs_heatmap_canvas)]:
+                    canvas.figure.savefig(str(base / f"{name}_{rl}.png"), dpi=150,
+                                          facecolor="#1e1e2e", bbox_inches="tight")
 
             QMessageBox.information(self, "Export", f"Exported to:\n{folder}")
             self.statusBar().showMessage(f"Exported {rl} to {folder}")

@@ -155,8 +155,10 @@ def read_profile(file_path: str | Path) -> ProfileData:
 
     # --- Calibrate ---
     # Z conversion: DAC units → nm
+    # Z_sensitivity carries a sign (negative for Height channel) → preserve it
+    # so the profile direction matches XE Software convention.
     z_sens_m = header["z_sensitivity_m"]
-    z_nm = raw_data / DAC_FULL_SCALE * abs(z_sens_m) * 1e9
+    z_nm = raw_data / DAC_FULL_SCALE * z_sens_m * 1e9
 
     # X axis: 0 to scan_size in mm
     scan_size_mm = header["scan_size_um"] / 1000.0

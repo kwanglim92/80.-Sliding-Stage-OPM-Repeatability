@@ -133,3 +133,88 @@ def export_checklist(result: AnalysisResult, output_path: str | Path) -> None:
                 p = source[pos]
                 f.write(f"{pos:<10} {p.rep_max:>10.3f} {p.rep_1sigma:>10.3f} "
                         f"{p.opm_max:>10.3f} {p.opm_1sigma:>10.3f}\n")
+
+
+def export_ball_screw_csv(
+    bs_result,
+    output_dir: str | Path,
+    include_stabilization: bool = False,
+) -> None:
+    """Export Ball Screw Pitch analysis results as CSV files.
+
+    Exports two files:
+      - ball_screw_dishing.csv : Position × Repeat Dishing matrix + stats
+      - ball_screw_erosion.csv : Position × Repeat Erosion matrix
+
+    Args:
+        bs_result: BallScrewAnalysisResult instance.
+        output_dir: Output directory path.
+        include_stabilization: If True, include the stabilization point row.
+    """
+    from ..core.ball_screw_analyzer import get_dishing_matrix
+    import numpy as np
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    positions, repeat_labels, dishing_matrix = get_dishing_matrix(
+        bs_result, include_stabilization=include_stabilization)
+
+    n_pos = len(positions)
+    n_rep = len(repeat_labels)
+
+    # ── Dishing CSV ────────────────────────────────────────────────────────
+    dishing_path = out / "ball_screw_dishing.csv"
+    with open(dishing_path, "w", encoding="utf-8-sig", newline="") as f:
+        # Header
+        f.write(f"Material: {bs_result.material},")
+        f.write(f"Spec Limit: {bs_result.spec_limit} nm,")
+        f.write(f"Judgment (MAX): {'PASS' if bs_result.overall_pass else 'FAIL'}\n")
+        f.write(f"Signal Source: {bs_result.signal_source}\n\n")
+
+        # Column headers
+        cols = ["Position"] + repeat_labels + ["Mean (nm)", "Stdev (nm)", "Max (nm)", "Min (nm)", "Spec Pass"]
+        f.write(",".join(cols) + "\n")
+
+        # Data rows
+        for i, pos in enumerate(positions):
+            row_vals = dishing_matrix[i, :]
+            valid = row_vals[~np.isnan(row_vals)]
+            mean_v = f"{np.mean(valid):.3f}" if len(valid) else ""
+            std_v = f"{np.std(valid, ddof=0):.3f}" if len(valid) else ""
+            max_v = f"{np.max(valid):.3f}" if len(valid) else ""
+            min_v = f"{np.min(valid):.3f}" if len(valid) else ""
+
+            is_stab = pos == "1_LT_stab"
+            if not is_stab and len(valid):
+                spec_ok = "PASS" if np.max(valid) <= bs_result.spec_limit else "FAIL"
+            else:
+                spec_ok = "N/A"
+
+            rep_vals = [f"{v:.3f}" if not np.isnan(v) else "" for v in row_vals]
+            row = [pos] + rep_vals + [mean_v, std_v, max_v, min_v, spec_ok]
+            f.write(",".join(row) + "\n")
+
+    # ── Erosion CSV ────────────────────────────────────────────────────────
+    erosion_path = out / "ball_screw_erosion.csv"
+    with open(erosion_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(f"Material: {bs_result.material},Signal Source: {bs_result.signal_source}\n\n")
+
+        cols = ["Position"] + repeat_labels + ["Mean (nm)", "Stdev (nm)"]
+        f.write(",".join(cols) + "\n")
+
+        for pos in positions:
+            erosion_per_rep = []
+            for rep in bs_result.all_repeats:
+                pts = [p for p in rep.points if p.position == pos]
+                val = pts[0].erosion_nm if pts else float("nan")
+                erosion_per_rep.append(val)
+
+            valid = [v for v in erosion_per_rep if not (v != v)]
+            mean_v = f"{sum(valid)/len(valid):.3f}" if valid else ""
+            std_v = f"{float(np.std(valid, ddof=0)):.3f}" if len(valid) > 1 else ""
+
+            rep_vals = [f"{v:.3f}" if not (v != v) else "" for v in erosion_per_rep]
+            row = [pos] + rep_vals + [mean_v, std_v]
+            f.write(",".join(row) + "\n")
+

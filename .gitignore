@@ -38,3 +38,11 @@ Desktop.ini
 
 # Gemini / AI artifacts
 .gemini/
+
+# Debug / Temp scripts (local only)
+_debug_*.py
+_test_*.py
+_verify_*.py
+_check_*.py
+_syntax_*.py
+_verify_out.txt

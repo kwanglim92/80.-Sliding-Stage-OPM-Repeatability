@@ -13,16 +13,15 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QFileDialog, QMessageBox, QProgressBar,
-    QFrame, QGridLayout, QScrollArea,
+    QFrame, QGridLayout, QScrollArea, QSlider,
 )
-
 import matplotlib
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
@@ -35,6 +34,9 @@ from ..core.data_loader import (
     POSITION_GRID, _detect_range_mm,
 )
 from ..core.analyzer import analyze_recipe, AnalysisResult, get_summary_table
+from ..core.qc_checker import run_qc_checks, QCResult
+from ..core.comparator import compare_results, get_compare_table, CompareResult
+from ..core.analyzer import compute_normalized_opm
 from ..core.flatten import FlattenProcessor
 from ..core.time_analysis import extract_recipe_timing, RecipeTiming, format_timing_summary
 from ..core.ball_screw_analyzer import (
@@ -155,6 +157,10 @@ class MainWindow(QMainWindow):
         self.current_result: Optional[AnalysisResult] = None
         self.current_timing: Optional[RecipeTiming] = None
         self.current_bs_result: Optional[BallScrewAnalysisResult] = None
+        self.current_qc_result: Optional[QCResult] = None
+        self.current_compare_result: Optional[CompareResult] = None
+        self.reference_dataset = None  # DataSet for comparison
+        self.reference_result: Optional[AnalysisResult] = None
         self.flatten_proc = FlattenProcessor()
         self._worker: Optional[LoadWorker] = None
         self._loaded_path: Optional[str] = None
@@ -174,51 +180,128 @@ class MainWindow(QMainWindow):
         layout.addWidget(load_group)
 
         # Main: Splitter (Settings | Tabs)
-        splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = QSplitter(Qt.Horizontal)
 
         # Left: Settings
-        settings_widget = self._create_settings_panel()
-        splitter.addWidget(settings_widget)
+        self.settings_widget = self._create_settings_panel()
+        self.main_splitter.addWidget(self.settings_widget)
 
-        # Right: Tabs (NO EMOJIS)
+        # Right: Category Tabs (2-level nested QTabWidget)
         self.tabs = QTabWidget()
         self.tabs.setMinimumWidth(600)
 
+        # -- Category tab styling (outer tabs: larger, with icons) --
+        self.tabs.setStyleSheet("""
+            QTabWidget > QTabBar::tab {
+                font-size: 13px; font-weight: bold; padding: 10px 20px;
+            }
+        """)
+
+        # Create all tab widgets first
         self.profile_canvas = FigureCanvas(Figure(figsize=(12, 9)))
-        self.tabs.addTab(self.profile_canvas, "Profile Charts")
-
         self.summary_table = self._create_summary_table()
-        self.tabs.addTab(self.summary_table, "Summary Table")
-
         self.flatten_widget = self._create_flatten_tab()
-        self.tabs.addTab(self.flatten_widget, "Flatten")
-
         self.trend_canvas = FigureCanvas(Figure(figsize=(10, 6)))
-        self.tabs.addTab(self.trend_canvas, "Saturation Trend")
-
         self.wafer_canvas = FigureCanvas(Figure(figsize=(8, 7)))
-        self.tabs.addTab(self.wafer_canvas, "Wafer Map")
-
         self.best5_canvas = FigureCanvas(Figure(figsize=(12, 6)))
-        self.tabs.addTab(self.best5_canvas, "Best-5 Window")
-
         self.time_widget = self._create_time_tab()
-        self.tabs.addTab(self.time_widget, "Time Analysis")
-
-        # Ball Screw Pitch tab
         self.bs_widget = self._create_ball_screw_tab()
-        self.tabs.addTab(self.bs_widget, "Ball Screw Pitch")
-
-        # Remark tab (Export + notes)
+        self.res_compare_canvas = FigureCanvas(Figure(figsize=(14, 7)))
+        self.qc_widget = self._create_qc_tab()
+        self.compare_widget = self._create_compare_tab()
         self.remark_widget = self._create_remark_tab()
-        self.tabs.addTab(self.remark_widget, "Remark")
 
-        splitter.addWidget(self.tabs)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 1000])
+        # Profile Charts wrapper with Y-axis scale toolbar
+        self.profile_tab_widget = QWidget()
+        _pl = QVBoxLayout(self.profile_tab_widget)
+        _pl.setContentsMargins(0, 0, 0, 0)
+        _pl.setSpacing(2)
+        _toolbar = QHBoxLayout()
+        _toolbar.addWidget(QLabel("Y-Axis:"))
+        self.y_scale_combo = QComboBox()
+        self.y_scale_combo.addItems(["Auto", "Unified", "Group"])
+        self.y_scale_combo.setFixedWidth(110)
+        self.y_scale_combo.currentTextChanged.connect(self._update_profile_chart)
+        _toolbar.addWidget(self.y_scale_combo)
 
-        layout.addWidget(splitter)
+        # Separator
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.VLine)
+        _sep.setFixedHeight(20)
+        _toolbar.addWidget(_sep)
+
+        # Resolution simulation slider
+        _toolbar.addWidget(QLabel("Resolution:"))
+        self.res_slider = QSlider(Qt.Horizontal)
+        self.res_slider.setMinimum(1)
+        self.res_slider.setMaximum(1)  # Updated when recipe loads
+        self.res_slider.setValue(1)
+        self.res_slider.setFixedWidth(200)
+        self.res_slider.setToolTip("Simulate lower resolution by block-averaging pixels")
+        self.res_slider.valueChanged.connect(self._on_res_slider_changed)
+        _toolbar.addWidget(self.res_slider)
+        self.res_slider_label = QLabel("Original")
+        self.res_slider_label.setFixedWidth(160)
+        _toolbar.addWidget(self.res_slider_label)
+        self.res_reset_btn = QPushButton("Reset")
+        self.res_reset_btn.setFixedWidth(50)
+        self.res_reset_btn.clicked.connect(lambda: self.res_slider.setValue(1))
+        _toolbar.addWidget(self.res_reset_btn)
+
+        _toolbar.addStretch()
+        _pl.addLayout(_toolbar)
+        _pl.addWidget(self.profile_canvas)
+
+        # Inner tab style (compact)
+        _inner_tab_style = """
+            QTabBar::tab { font-size: 12px; padding: 6px 14px; }
+        """
+
+        # Analysis category
+        self.analysis_tabs = QTabWidget()
+        self.analysis_tabs.setStyleSheet(_inner_tab_style)
+        self.analysis_tabs.addTab(self.profile_tab_widget, "Profile Charts")
+        self.analysis_tabs.addTab(self.summary_table, "Summary Table")
+        self.analysis_tabs.addTab(self.flatten_widget, "Flatten")
+        self.analysis_tabs.addTab(self.bs_widget, "Ball Screw Pitch")
+
+        # Visualization category
+        self.viz_tabs = QTabWidget()
+        self.viz_tabs.setStyleSheet(_inner_tab_style)
+        self.viz_tabs.addTab(self.trend_canvas, "Saturation Trend")
+        self.viz_tabs.addTab(self.wafer_canvas, "Wafer Map")
+        self.viz_tabs.addTab(self.res_compare_canvas, "Resolution Compare")
+
+        # Quality category
+        self.quality_tabs = QTabWidget()
+        self.quality_tabs.setStyleSheet(_inner_tab_style)
+        self.quality_tabs.addTab(self.qc_widget, "QC Check")
+        self.quality_tabs.addTab(self.compare_widget, "Compare")
+
+        # Tools category
+        self.tools_tabs = QTabWidget()
+        self.tools_tabs.setStyleSheet(_inner_tab_style)
+        self.tools_tabs.addTab(self.time_widget, "Time Analysis")
+        self.tools_tabs.addTab(self.best5_canvas, "Best-5 Window")
+        self.tools_tabs.addTab(self.remark_widget, "Remark")
+
+        # Register categories in outer tab
+        self.tabs.addTab(self.analysis_tabs, "Analysis")
+        self.tabs.addTab(self.viz_tabs, "Visualization")
+        self.tabs.addTab(self.quality_tabs, "Quality")
+        self.tabs.addTab(self.tools_tabs, "Tools")
+
+        self.main_splitter.addWidget(self.tabs)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([260, 1000])
+
+        layout.addWidget(self.main_splitter)
+
+        # F11: Toggle side panel
+        self._side_panel_visible = True
+        shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
+        shortcut.activated.connect(self._toggle_side_panel)
 
         # Status Bar
         self.statusBar().showMessage("Ready. Select a data folder to begin.")
@@ -226,6 +309,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximumWidth(200)
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
+
+    def _toggle_side_panel(self):
+        """Toggle left settings panel visibility (F11)."""
+        self._side_panel_visible = not self._side_panel_visible
+        self.settings_widget.setVisible(self._side_panel_visible)
+        if self._side_panel_visible:
+            self.main_splitter.setSizes([260, 1000])
+            self.statusBar().showMessage("Side panel shown (F11)", 2000)
+        else:
+            self.statusBar().showMessage("Side panel hidden (F11)", 2000)
 
     def _create_load_panel(self) -> QGroupBox:
         group = QGroupBox("Data Loading")
@@ -245,7 +338,8 @@ class MainWindow(QMainWindow):
 
     def _create_settings_panel(self) -> QWidget:
         widget = QWidget()
-        widget.setFixedWidth(260)
+        widget.setMinimumWidth(260)
+        widget.setMaximumWidth(260)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -390,6 +484,29 @@ class MainWindow(QMainWindow):
         spec_inner.addWidget(self.spec_verdict_label)
 
         layout.addWidget(spec_frame)
+
+        # Scan Parameters
+        scan_frame = QFrame()
+        scan_frame.setObjectName("scanFrame")
+        scan_frame.setStyleSheet(
+            "QFrame#scanFrame { border: 1px solid #45475a; border-radius: 6px; }")
+        scan_inner = QVBoxLayout(scan_frame)
+        scan_inner.setContentsMargins(10, 8, 10, 8)
+        scan_inner.setSpacing(2)
+
+        scan_title = QLabel("Scan Parameters")
+        scan_title.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #89b4fa; border: none;")
+        scan_inner.addWidget(scan_title)
+
+        self.scan_info_label = QLabel("—")
+        self.scan_info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.scan_info_label.setStyleSheet(
+            "font-size: 11px; color: #a6adc8; line-height: 1.4; border: none;")
+        self.scan_info_label.setWordWrap(True)
+        scan_inner.addWidget(self.scan_info_label)
+
+        layout.addWidget(scan_frame)
 
         # Data Info — stretch to fill remaining space
         info_group = QGroupBox("Data Info")
@@ -631,8 +748,398 @@ class MainWindow(QMainWindow):
 
         return widget
 
+    # ─── QC Check Tab ────────────────────────────────────────
+
+    _QC_COLORS = {"PASS": "#a6e3a1", "WARN": "#f9e2af", "FAIL": "#f38ba8"}
+    _QC_CHECK_NAMES = [
+        ("QC-1", "File Matching (Recipe vs Raw)"),
+        ("QC-2", "Data Equivalence"),
+        ("QC-3", "Scan Parameter Consistency"),
+        ("QC-4", "Position Completeness"),
+        ("QC-5", "Outlier Detection"),
+        ("QC-6", "Pixel Count Consistency"),
+    ]
+
+    def _create_qc_tab(self) -> QWidget:
+        """QC Check tab — data integrity verification."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # ── Controls row ──
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        self.qc_run_btn = QPushButton("Run QC")
+        self.qc_run_btn.setStyleSheet(
+            "background-color: #40a02b; color: white; font-weight: bold; padding: 4px 14px;")
+        self.qc_run_btn.clicked.connect(self._on_qc_run)
+        ctrl_row.addWidget(self.qc_run_btn)
+
+        self.qc_verdict_label = QLabel("-")
+        self.qc_verdict_label.setAlignment(Qt.AlignCenter)
+        self.qc_verdict_label.setFixedWidth(80)
+        self.qc_verdict_label.setStyleSheet(
+            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "border-radius: 6px; padding: 4px; color: #a6adc8;")
+        ctrl_row.addWidget(self.qc_verdict_label)
+
+        self.qc_timestamp_label = QLabel("")
+        self.qc_timestamp_label.setStyleSheet("font-size: 11px; color: #6c7086;")
+        ctrl_row.addWidget(self.qc_timestamp_label)
+
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        # ── Summary panel (6 check items) ──
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet(
+            "QFrame#qcSummary { background-color: #181825; border: 1px solid #45475a;"
+            "border-radius: 6px; }")
+        summary_frame.setObjectName("qcSummary")
+        summary_grid = QGridLayout(summary_frame)
+        summary_grid.setContentsMargins(12, 8, 12, 8)
+        summary_grid.setHorizontalSpacing(12)
+        summary_grid.setVerticalSpacing(4)
+
+        self.qc_summary_labels: list[tuple[QLabel, QLabel, QLabel]] = []
+        for i, (check_id, check_name) in enumerate(self._QC_CHECK_NAMES):
+            status_lbl = QLabel("-")
+            status_lbl.setFixedWidth(36)
+            status_lbl.setAlignment(Qt.AlignCenter)
+            status_lbl.setStyleSheet(
+                "font-size: 12px; font-weight: bold; color: #6c7086;")
+
+            name_lbl = QLabel(f"{check_id}: {check_name}")
+            name_lbl.setStyleSheet("font-size: 12px; color: #cdd6f4;")
+
+            summary_lbl = QLabel("")
+            summary_lbl.setStyleSheet("font-size: 11px; color: #a6adc8;")
+
+            summary_grid.addWidget(status_lbl, i, 0)
+            summary_grid.addWidget(name_lbl, i, 1)
+            summary_grid.addWidget(summary_lbl, i, 2)
+            self.qc_summary_labels.append((status_lbl, name_lbl, summary_lbl))
+
+        layout.addWidget(summary_frame)
+
+        # ── Detail section ──
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(8)
+        detail_row.addWidget(QLabel("Detail:"))
+        self.qc_detail_combo = QComboBox()
+        for check_id, check_name in self._QC_CHECK_NAMES:
+            self.qc_detail_combo.addItem(f"{check_id}: {check_name}")
+        self.qc_detail_combo.setFixedWidth(280)
+        self.qc_detail_combo.currentIndexChanged.connect(self._on_qc_detail_changed)
+        detail_row.addWidget(self.qc_detail_combo)
+        detail_row.addStretch()
+        layout.addLayout(detail_row)
+
+        self.qc_detail_table = QTableWidget()
+        self.qc_detail_table.setStyleSheet("""
+            QTableWidget { font-size: 12px; }
+            QTableWidget::item { padding: 4px; }
+            QHeaderView::section { font-size: 12px; padding: 6px;
+                background-color: #313244; color: #89b4fa;
+                border: 1px solid #45475a; font-weight: bold; }
+        """)
+        self.qc_detail_table.verticalHeader().setDefaultSectionSize(26)
+        self.qc_detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.qc_detail_table)
+
+        return widget
+
+    def _on_qc_run(self):
+        """Run QC checks on current recipe."""
+        if not self.current_recipe:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+        try:
+            self.statusBar().showMessage("Running QC checks...")
+            QApplication.processEvents()
+            signal_source = self.source_combo.currentText()
+            self.current_qc_result = run_qc_checks(self.current_recipe, signal_source)
+            self._update_qc_tab()
+            self.statusBar().showMessage(
+                f"QC Check complete: {self.current_qc_result.overall_status}")
+        except Exception as e:
+            QMessageBox.critical(self, "QC Check Error", f"{type(e).__name__}: {e}")
+
+    def _update_qc_tab(self):
+        """Update QC tab from current_qc_result."""
+        qc = self.current_qc_result
+        if qc is None:
+            self._clear_qc_tab()
+            return
+
+        # Verdict badge
+        color = self._QC_COLORS.get(qc.overall_status, "#a6adc8")
+        self.qc_verdict_label.setText(qc.overall_status)
+        self.qc_verdict_label.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; border: 2px solid {color};"
+            f"border-radius: 6px; padding: 4px; color: {color};")
+        self.qc_timestamp_label.setText(qc.timestamp)
+
+        # Summary rows
+        for i, check in enumerate(qc.checks):
+            if i >= len(self.qc_summary_labels):
+                break
+            status_lbl, name_lbl, summary_lbl = self.qc_summary_labels[i]
+            c = self._QC_COLORS.get(check.status, "#a6adc8")
+            status_lbl.setText(check.status)
+            status_lbl.setStyleSheet(
+                f"font-size: 12px; font-weight: bold; color: {c};"
+                f"border: 1px solid {c}; border-radius: 3px;")
+            summary_lbl.setText(check.summary)
+
+        # Detail table
+        self._on_qc_detail_changed()
+
+    def _clear_qc_tab(self):
+        """Reset QC tab to initial state."""
+        self.qc_verdict_label.setText("-")
+        self.qc_verdict_label.setStyleSheet(
+            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "border-radius: 6px; padding: 4px; color: #a6adc8;")
+        self.qc_timestamp_label.setText("")
+
+        for status_lbl, name_lbl, summary_lbl in self.qc_summary_labels:
+            status_lbl.setText("-")
+            status_lbl.setStyleSheet(
+                "font-size: 12px; font-weight: bold; color: #6c7086;")
+            summary_lbl.setText("")
+
+        self.qc_detail_table.clear()
+        self.qc_detail_table.setRowCount(0)
+        self.qc_detail_table.setColumnCount(0)
+
+    def _on_qc_detail_changed(self):
+        """Populate detail table for the selected QC check."""
+        idx = self.qc_detail_combo.currentIndex()
+        qc = self.current_qc_result
+        if qc is None or idx < 0 or idx >= len(qc.checks):
+            self.qc_detail_table.clear()
+            self.qc_detail_table.setRowCount(0)
+            self.qc_detail_table.setColumnCount(0)
+            return
+
+        check = qc.checks[idx]
+        details = check.details
+        if not details:
+            self.qc_detail_table.clear()
+            self.qc_detail_table.setRowCount(0)
+            self.qc_detail_table.setColumnCount(1)
+            self.qc_detail_table.setHorizontalHeaderLabels(["Info"])
+            self.qc_detail_table.setRowCount(1)
+            self.qc_detail_table.setItem(0, 0, QTableWidgetItem("No detail data"))
+            return
+
+        # Build table from detail dicts
+        columns = list(details[0].keys())
+        self.qc_detail_table.clear()
+        self.qc_detail_table.setColumnCount(len(columns))
+        self.qc_detail_table.setHorizontalHeaderLabels(columns)
+        self.qc_detail_table.setRowCount(len(details))
+
+        for row_idx, row_data in enumerate(details):
+            for col_idx, col_key in enumerate(columns):
+                val = row_data.get(col_key, "")
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+
+                # Color-code status column and outlier rows
+                status_val = row_data.get("status", "")
+                if col_key == "status":
+                    c = self._QC_COLORS.get(status_val, "#cdd6f4")
+                    item.setForeground(QColor(c))
+                elif status_val in ("FAIL", "WARN"):
+                    if col_key == "is_outlier" and row_data.get("is_outlier"):
+                        item.setForeground(QColor(self._QC_COLORS["WARN"]))
+                    elif status_val == "FAIL":
+                        item.setForeground(QColor(self._QC_COLORS["FAIL"]))
+
+                self.qc_detail_table.setItem(row_idx, col_idx, item)
+
+    # ─── Resolution Compare ──────────────────────────────────
+
+    def _update_resolution_compare(self):
+        """Update cross-range resolution comparison chart."""
+        if not self.dataset or len(self.dataset.recipes) < 2:
+            return
+
+        try:
+            from ..visualization.plot_manager import create_resolution_comparison_figure
+
+            # Find max resolution (lowest res = largest nm/px)
+            max_res = 0
+            for label, recipe in self.dataset.recipes.items():
+                for repeat in recipe.repeats:
+                    for pos, prof in repeat.profiles.items():
+                        px = len(prof.raw_data)
+                        res = prof.scan_size_um * 1000 / px if px > 0 else 0
+                        if res > max_res:
+                            max_res = res
+                    break  # Only need first repeat
+
+            if max_res == 0:
+                return
+
+            # Compute normalized OPM for each range
+            norm_data = {}
+            for label in sorted(self.dataset.recipes.keys(),
+                                key=lambda x: int(x.replace('mm', '')),
+                                reverse=True):
+                recipe = self.dataset.recipes[label]
+                norm_data[label] = compute_normalized_opm(recipe, max_res)
+
+            # Get spec limits based on equipment type
+            from ..core.analyzer import SPEC_MAX_OPM_ISO, SPEC_MAX_OPM_DW
+            equipment_type = "iso" if self.radio_iso.isChecked() else "dw"
+            spec_limits = SPEC_MAX_OPM_ISO if equipment_type == "iso" else SPEC_MAX_OPM_DW
+
+            fig = create_resolution_comparison_figure(norm_data, figsize=(14, 7),
+                                                      spec_limits=spec_limits)
+            self._update_canvas(self.res_compare_canvas, fig)
+        except Exception as e:
+            self.statusBar().showMessage(f"Resolution Compare error: {e}")
+
+    # ─── Compare Tab ─────────────────────────────────────────
+
+    def _create_compare_tab(self) -> QWidget:
+        """Compare tab — cross-process comparison."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # Controls
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        self.compare_load_btn = QPushButton("Load Reference")
+        self.compare_load_btn.setStyleSheet(
+            "background-color: #1e66f5; color: white; font-weight: bold; padding: 4px 14px;")
+        self.compare_load_btn.clicked.connect(self._on_compare_load)
+        ctrl_row.addWidget(self.compare_load_btn)
+
+        self.compare_info_label = QLabel("No reference loaded")
+        self.compare_info_label.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        ctrl_row.addWidget(self.compare_info_label)
+
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        # Compare table
+        self.compare_table = QTableWidget()
+        self.compare_table.setStyleSheet("""
+            QTableWidget { font-size: 12px; }
+            QTableWidget::item { padding: 4px; }
+            QHeaderView::section { font-size: 12px; padding: 6px;
+                background-color: #313244; color: #89b4fa;
+                border: 1px solid #45475a; font-weight: bold; }
+        """)
+        self.compare_table.verticalHeader().setDefaultSectionSize(26)
+        self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.compare_table)
+
+        return widget
+
+    def _on_compare_load(self):
+        """Load reference data for comparison."""
+        if not self.current_result:
+            QMessageBox.warning(self, "No Data", "Load primary data first.")
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Reference Data Folder")
+        if not folder:
+            return
+
+        try:
+            self.statusBar().showMessage("Loading reference data...")
+            QApplication.processEvents()
+
+            from ..core.data_loader import load_recipe, load_dataset
+            from ..core.analyzer import analyze_recipe
+            from pathlib import Path
+
+            ref_path = Path(folder)
+
+            # Try to load matching range
+            signal = self.source_combo.currentText()
+            ref_recipe = load_recipe(ref_path, signal_source=signal)
+
+            equipment_type = "dw" if self.equip_dw_radio.isChecked() else "iso"
+            window_size = self.window_spin.value()
+            self.reference_result = analyze_recipe(
+                ref_recipe, window_size=window_size,
+                equipment_type=equipment_type)
+
+            self.current_compare_result = compare_results(
+                self.current_result, self.reference_result)
+            self.current_compare_result.current_label = self.current_recipe.range_label
+            self.current_compare_result.reference_label = f"Ref ({ref_path.name})"
+
+            self._update_compare_tab()
+            self.compare_info_label.setText(
+                f"Reference: {ref_path.name} ({ref_recipe.range_label}, "
+                f"{ref_recipe.repeat_count} repeats)")
+            self.statusBar().showMessage("Comparison complete.")
+        except Exception as e:
+            QMessageBox.critical(self, "Compare Error", f"{type(e).__name__}: {e}")
+
+    def _update_compare_tab(self):
+        """Update compare table from current_compare_result."""
+        cmp = self.current_compare_result
+        if cmp is None:
+            self._clear_compare_tab()
+            return
+
+        rows = get_compare_table(cmp)
+        if not rows:
+            return
+
+        columns = list(rows[0].keys())
+        self.compare_table.clear()
+        self.compare_table.setColumnCount(len(columns))
+        self.compare_table.setHorizontalHeaderLabels(columns)
+        self.compare_table.setRowCount(len(rows))
+
+        for i, row in enumerate(rows):
+            for j, col in enumerate(columns):
+                val = row.get(col, "")
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+
+                # Color-code delta columns
+                if "Δ" in col and isinstance(val, (int, float)):
+                    if val > 0:
+                        item.setForeground(QColor("#f38ba8"))  # red = worse
+                    elif val < 0:
+                        item.setForeground(QColor("#a6e3a1"))  # green = better
+
+                # Group rows
+                if row.get("Position", "").startswith("["):
+                    item.setBackground(QColor("#1e1e2e"))
+                    item.setForeground(QColor("#f9e2af"))
+                    item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+
+                self.compare_table.setItem(i, j, item)
+
+    def _clear_compare_tab(self):
+        """Reset compare tab."""
+        self.compare_table.clear()
+        self.compare_table.setRowCount(0)
+        self.compare_table.setColumnCount(0)
+        self.compare_info_label.setText("No reference loaded")
+
     def _create_remark_tab(self) -> QWidget:
-        """Remark tab — Export + Usage Guide."""
+        """Remark tab — Export + Split-Pane Usage Guide."""
+        from PySide6.QtWidgets import QTextBrowser, QListWidget, QSplitter
+
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -673,103 +1180,504 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(export_frame)
 
-        # Usage Guide
-        from PySide6.QtWidgets import QTextBrowser
-        guide = QTextBrowser()
-        guide.setOpenExternalLinks(False)
-        guide.setStyleSheet(
+        # Split-Pane Guide: Left menu + Right content
+        self._guide_contents = self._get_guide_contents()
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background-color: #45475a; width: 2px; }")
+
+        # Left: topic list
+        self.guide_list = QListWidget()
+        self.guide_list.setStyleSheet("""
+            QListWidget {
+                background-color: #181825; color: #cdd6f4;
+                border: 1px solid #45475a; border-radius: 6px;
+                font-size: 13px; padding: 4px;
+            }
+            QListWidget::item {
+                padding: 8px 12px; border-radius: 4px;
+            }
+            QListWidget::item:selected {
+                background-color: #313244; color: #89b4fa; font-weight: bold;
+            }
+            QListWidget::item:hover {
+                background-color: #1e1e2e;
+            }
+        """)
+        for title, _ in self._guide_contents:
+            self.guide_list.addItem(title)
+        self.guide_list.setFixedWidth(210)
+        self.guide_list.currentRowChanged.connect(self._on_guide_topic_changed)
+
+        # Right: content browser
+        self.guide_browser = QTextBrowser()
+        self.guide_browser.setOpenExternalLinks(False)
+        self.guide_browser.setStyleSheet(
             "QTextBrowser { background-color: #181825; color: #cdd6f4;"
             "border: 1px solid #45475a; border-radius: 6px;"
-            "padding: 12px; font-size: 12px; }")
-        guide.setHtml(self._get_usage_guide_html())
-        layout.addWidget(guide, 1)
+            "padding: 16px; font-size: 12px; }")
+
+        splitter.addWidget(self.guide_list)
+        splitter.addWidget(self.guide_browser)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(splitter, 1)
+
+        # Select first topic
+        self.guide_list.setCurrentRow(0)
 
         return widget
 
+    def _on_guide_topic_changed(self, index: int):
+        """Display the selected guide topic content."""
+        if 0 <= index < len(self._guide_contents):
+            _, html = self._guide_contents[index]
+            self.guide_browser.setHtml(html)
+
     @staticmethod
-    def _get_usage_guide_html() -> str:
-        return """
-        <style>
-            h2 { color: #89b4fa; margin-top: 16px; margin-bottom: 4px; font-size: 15px; }
-            h3 { color: #f9e2af; margin-top: 12px; margin-bottom: 2px; font-size: 13px; }
-            p, li { color: #cdd6f4; font-size: 12px; line-height: 1.5; }
-            ul { margin-left: 16px; }
+    def _guide_style() -> str:
+        return """<style>
+            h2 { color: #89b4fa; margin-top: 12px; margin-bottom: 8px; font-size: 16px; }
+            h3 { color: #f9e2af; margin-top: 14px; margin-bottom: 4px; font-size: 13px; }
+            p, li { color: #cdd6f4; font-size: 12px; line-height: 1.6; }
+            ul { margin-left: 16px; margin-top: 4px; }
             .metric { color: #a6e3a1; font-weight: bold; }
             .note { color: #fab387; font-style: italic; }
-        </style>
+            .key { color: #89b4fa; font-weight: bold; }
+            .warn { color: #f9e2af; font-weight: bold; }
+            .fail { color: #f38ba8; font-weight: bold; }
+            .pass { color: #a6e3a1; font-weight: bold; }
+            table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+            th { background-color: #313244; color: #89b4fa; padding: 6px 10px;
+                 text-align: left; font-size: 12px; border: 1px solid #45475a; }
+            td { padding: 5px 10px; font-size: 12px; border: 1px solid #45475a; }
+        </style>"""
 
-        <h2>Sliding Stage OPM Repeatability Analyzer</h2>
-        <p>Park Systems Sliding Stage의 OPM 재현성을 분석하는 데스크탑 도구입니다.</p>
+    @staticmethod
+    def _get_guide_contents() -> list[tuple[str, str]]:
+        s = MainWindow._guide_style()
+        return [
+            ("Overview", f"""{s}
+            <h2>Sliding Stage OPM Repeatability Analyzer</h2>
+            <p>Park Systems Sliding Stage의 OPM 재현성을 분석하는 데스크탑 도구입니다.</p>
 
-        <h3>1. Profile Charts</h3>
-        <p>9개 Position (3×3 Grid)의 프로파일 오버레이를 표시합니다.</p>
-        <ul>
-        <li>각 서브플롯은 해당 Position의 <b>모든 Repeat</b> 프로파일을 겹쳐 보여줍니다.</li>
-        <li>겹침이 클수록 재현성이 좋고, 산포가 클수록 편차가 큽니다.</li>
-        <li>특정 Repeat에서 이상 프로파일이 보이면 장비 이상 / 환경 변화를 의심합니다.</li>
-        </ul>
+            <h3>탭 카테고리</h3>
+            <p>12개 기능이 4개 카테고리로 분류되어 있습니다:</p>
 
-        <h3>2. Summary Table</h3>
-        <p>Position별 통계 테이블입니다. Best-5 Window 기준 데이터를 사용합니다.</p>
-        <ul>
-        <li><span class='metric'>Rep. Max (nm)</span>: Pixel-wise Range의 최대값 (재현성 지표)</li>
-        <li><span class='metric'>Rep. 1σ (nm)</span>: Pixel-wise Range의 표준편차</li>
-        <li><span class='metric'>OPM Max (nm)</span>: Profile별 Max-Min 중 최대값</li>
-        <li><span class='metric'>OPM 1σ (nm)</span>: Profile별 Max-Min의 표준편차</li>
-        <li>하단 Total 행: Mean / Stdev / Max / RMS 요약</li>
-        </ul>
+            <table>
+            <tr><th>카테고리</th><th>탭</th><th>용도</th></tr>
+            <tr><td><b>Analysis</b></td>
+                <td>Profile Charts, Summary Table, Flatten, Ball Screw Pitch</td>
+                <td>핵심 분석 기능</td></tr>
+            <tr><td><b>Visualization</b></td>
+                <td>Saturation Trend, Wafer Map, Resolution Compare</td>
+                <td>차트/맵 시각화</td></tr>
+            <tr><td><b>Quality</b></td>
+                <td>QC Check, Compare</td>
+                <td>품질 검증</td></tr>
+            <tr><td><b>Tools</b></td>
+                <td>Time Analysis, Best-5 Window, Remark</td>
+                <td>보조 도구 + 가이드</td></tr>
+            </table>
 
-        <h3>3. Flatten</h3>
-        <p>개별 프로파일에 대해 Polynomial Flattening을 적용합니다.</p>
-        <ul>
-        <li><b>Position</b> / <b>Repeat</b> 선택 후 <b>Order</b> 설정 (권장: 1차 또는 2차)</li>
-        <li><b>Edge%</b>: 양쪽 가장자리 데이터 제외 비율 (기본 1%)</li>
-        <li>Execute 클릭 시 Original / Flattened / Histogram 시각화</li>
-        <li>OPM 변화량과 RMS 변화량이 Status Bar에 표시됩니다.</li>
-        </ul>
+            <h3>사용 순서</h3>
+            <ul>
+            <li>1. 좌측 상단 <b>Open Folder</b>로 데이터 폴더 선택</li>
+            <li>2. Signal Source (Height / Z Drive) 선택</li>
+            <li>3. Range 선택 시 자동 분석 실행</li>
+            <li>4. 각 탭에서 상세 결과 확인</li>
+            <li>5. Remark 탭에서 <b>Export Results</b>로 결과 내보내기</li>
+            </ul>
 
-        <h3>4. Saturation Trend</h3>
-        <p>Repeat 수 증가에 따른 Rep. 1σ Mean 추이를 보여줍니다.</p>
-        <ul>
-        <li>그래프가 <b>수렴</b>하면 현재 Repeat 수가 충분합니다.</li>
-        <li>아직 하강 추세이면 Repeat를 더 늘려야 합니다.</li>
-        <li>초기 값이 매우 높다가 급감하는 경우, 첫 Repeat에 이상이 있을 수 있습니다.</li>
-        </ul>
+            <h3>데이터 소스</h3>
+            <p>장비 측정 후 저장되는 <b>TIFF 파일</b>을 분석합니다.</p>
+            <ul>
+            <li>지원 형식: Park Systems XE 계열 Custom TIFF (Tag 50434/50435)</li>
+            <li>Profile: 1D Height 또는 Z Drive 신호 (8192 pixels)</li>
+            <li>측정 Grid: 9개 Position (3×3, 1_LT ~ 9_RB)</li>
+            </ul>
+            """),
 
-        <h3>5. Wafer Map</h3>
-        <p>3×3 Grid로 각 Position의 OPM Max를 Heatmap으로 표시합니다.</p>
-        <ul>
-        <li><b>빨간색</b>: 높은 값 (편차 큼) → 해당 위치 점검 필요</li>
-        <li><b>녹색</b>: 낮은 값 (편차 작음) → 양호</li>
-        <li>특정 영역에 빨간색이 몰려있으면 Stage의 기계적 문제를 의심합니다.</li>
-        </ul>
+            ("1. Scan Parameters", f"""{s}
+            <h2>Scan Parameters (좌측 패널)</h2>
+            <p>현재 로드된 Range의 측정 파라미터를 좌측 패널에 표시합니다.</p>
 
-        <h3>6. Best-5 Window</h3>
-        <p>연속된 5개(기본) Repeat 구간 중 최적 구간을 찾습니다.</p>
-        <ul>
-        <li>선정 기준: <b>Rep. 1σ Mean이 최소</b>인 구간</li>
-        <li>좌측 패널의 Window Size를 변경하면 즉시 재분석됩니다.</li>
-        <li>그래프: Best Window vs All Repeats의 Position별 비교</li>
-        </ul>
+            <h3>표시 항목</h3>
+            <table>
+            <tr><th>항목</th><th>의미</th><th>예시</th></tr>
+            <tr><td><b>Recipe</b></td><td>측정 Recipe 이름</td><td>Profile_25mm_Dynamic</td></tr>
+            <tr><td><b>Size</b></td><td>스캔 영역 크기 (µm)</td><td>25000 µm</td></tr>
+            <tr><td><b>Px</b></td><td>프로파일 데이터 포인트 수</td><td>8192</td></tr>
+            <tr><td><b>Resolution</b></td><td>픽셀당 물리적 크기 (nm/px)</td><td>3052 nm/px</td></tr>
+            <tr><td><b>Speed</b></td><td>스캔 속도 (mm/s)</td><td>0.1 mm/s</td></tr>
+            <tr><td><b>SP</b></td><td>Set Point — Tip-Surface 상호작용 강도</td><td>30.0</td></tr>
+            <tr><td><b>Z Gain</b></td><td>Z Servo Gain — 피드백 제어 이득</td><td>1.5</td></tr>
+            </table>
 
-        <h3>7. Time Analysis</h3>
-        <p>측정 소요 시간을 분석합니다.</p>
-        <ul>
-        <li>Repeat별 Start/End/Duration 및 포인트당 소요 시간</li>
-        <li>연속 측정 여부 확인 (Gap 2분 이상이면 중단이 있었음)</li>
-        <li>하단에서 N-repeat에 필요한 <b>예상 소요 시간</b>을 추정합니다.</li>
-        <li class='note'>공수 반영 시 활용: 10-repeat는 약 2배, 20-repeat는 약 4배 소요</li>
-        </ul>
+            <h3>Profile Charts 연동</h3>
+            <p>Profile Charts 탭의 상단 제목(suptitle)에도 동일한 파라미터가 한 줄로 요약 표시됩니다.</p>
+            <p>예: <code>25mm | 8192px | 3052nm/px | 0.1mm/s | SP=30.0</code></p>
 
-        <h3>8. Spec Judgment (좌측 패널)</h3>
-        <p>장비 타입에 따라 다른 기준으로 PASS/FAIL을 판단합니다.</p>
-        <ul>
-        <li><b>분리형 (Isolated AE)</b>: Total RMS / Total Max 기준</li>
-        <li><b>일체형 (Double Walled AE)</b>: Center(5_CM) 값 기준</li>
-        <li>OPM Repeatability + Max OPM 두 항목 <b>모두 PASS</b>해야 합격</li>
-        <li><b>?</b> 버튼을 클릭하면 전체 Spec 테이블을 확인할 수 있습니다.</li>
-        </ul>
-        """
+            <h3>활용</h3>
+            <ul>
+            <li>Range 변경 시 파라미터가 자동 갱신 → 측정 조건 즉시 확인</li>
+            <li>Range 간 파라미터 차이 파악 (예: 1mm만 Set Point가 다른 경우)</li>
+            <li>Resolution 차이가 OPM에 미치는 영향을 이해하는 기초 정보</li>
+            </ul>
+            """),
+
+            ("2. Profile Charts", f"""{s}
+            <h2>Profile Charts</h2>
+            <p>9개 Position (3×3 Grid)의 프로파일 오버레이를 표시합니다.</p>
+
+            <h3>읽는 방법</h3>
+            <ul>
+            <li>각 서브플롯은 해당 Position의 <b>모든 Repeat</b> 프로파일을 겹쳐 보여줍니다.</li>
+            <li>겹침이 클수록 재현성이 좋고, 산포가 클수록 편차가 큽니다.</li>
+            <li>특정 Repeat에서 이상 프로파일이 보이면 장비 이상 / 환경 변화를 의심합니다.</li>
+            </ul>
+
+            <h3>Position 배치</h3>
+            <table>
+            <tr><td>1_LT (좌상)</td><td>2_CT (중상)</td><td>3_RT (우상)</td></tr>
+            <tr><td>4_LM (좌중)</td><td>5_CM (중앙)</td><td>6_RM (우중)</td></tr>
+            <tr><td>7_LB (좌하)</td><td>8_CB (중하)</td><td>9_RB (우하)</td></tr>
+            </table>
+
+            <h3>Y-Axis 스케일 모드</h3>
+            <p>차트 상단의 <b>Y-Axis</b> 콤보박스로 9개 서브플롯의 Y축 스케일을 전환할 수 있습니다.</p>
+
+            <table>
+            <tr><th>모드</th><th>동작</th><th>용도</th></tr>
+            <tr><td><b>Auto</b></td>
+                <td>각 서브플롯 독립 auto-scale</td>
+                <td>개별 Position의 세부 형상 관찰</td></tr>
+            <tr><td><b>Unified</b></td>
+                <td>9개 전체 동일 Y축 범위 (±max)</td>
+                <td>Position 간 OPM 크기 비교</td></tr>
+            <tr><td><b>Group</b></td>
+                <td>Center/Side/Edge 그룹별 동일 Y축</td>
+                <td>그룹 내 비교 (Edge가 Center를 압축하지 않음)</td></tr>
+            </table>
+
+            <p><b>Unified</b>로 전환하면 2nm 변동과 20nm 변동의 차이가 시각적으로 즉시 드러납니다.
+            <b>Group</b> 모드는 Edge의 큰 OPM이 Center 디테일을 압축하는 것을 방지하면서
+            같은 그룹 내 Position을 비교할 때 유용합니다.</p>
+
+            <h3>활용 팁</h3>
+            <ul>
+            <li>Edge 영역(1_LT, 3_RT, 7_LB, 9_RB)은 Center보다 OPM이 높은 것이 일반적입니다.</li>
+            <li>프로파일 형상이 Repeat 간 크게 변하면 Stage 안정성 점검이 필요합니다.</li>
+            <li><b>Unified</b> 모드에서 특정 Position만 유독 크면 해당 위치의 Stage 문제를 의심합니다.</li>
+            </ul>
+            """),
+
+            ("3. Summary Table", f"""{s}
+            <h2>Summary Table</h2>
+            <p>Position별 통계 테이블입니다. Best-5 Window 기준 데이터를 사용합니다.</p>
+
+            <h3>지표 설명</h3>
+            <table>
+            <tr><th>지표</th><th>정의</th><th>의미</th></tr>
+            <tr><td><span class='metric'>Rep. Max</span></td>
+                <td>Pixel-wise Range의 최대값</td><td>재현성 최악 지점</td></tr>
+            <tr><td><span class='metric'>Rep. 1σ</span></td>
+                <td>Pixel-wise Range의 표준편차</td><td>재현성 산포</td></tr>
+            <tr><td><span class='metric'>OPM Max</span></td>
+                <td>Profile별 Max-Min 중 최대값</td><td>프로파일 형상 크기</td></tr>
+            <tr><td><span class='metric'>OPM 1σ</span></td>
+                <td>Profile별 Max-Min의 표준편차</td><td>형상 변동성</td></tr>
+            </table>
+
+            <h3>Total 행 해석</h3>
+            <ul>
+            <li><b>Mean</b>: 9개 Position 평균값</li>
+            <li><b>Stdev</b>: Position 간 편차</li>
+            <li><b>Max</b>: 최대값 (Spec 판정에 사용)</li>
+            <li><b>RMS</b>: Root Mean Square (Spec 판정에 사용)</li>
+            </ul>
+            """),
+
+            ("4. Flatten", f"""{s}
+            <h2>Flatten</h2>
+            <p>개별 프로파일에 대해 Polynomial Flattening을 적용합니다.</p>
+
+            <h3>사용 방법</h3>
+            <ul>
+            <li><b>Position</b> / <b>Repeat</b> 선택 후 <b>Order</b> 설정</li>
+            <li><b>Edge%</b>: 양쪽 가장자리 데이터 제외 비율 (기본 1%)</li>
+            <li><b>Execute</b> 클릭 시 Original / Flattened / Histogram 시각화</li>
+            <li>OPM 변화량과 RMS 변화량이 Status Bar에 표시됩니다.</li>
+            </ul>
+
+            <h3>Order 선택 가이드</h3>
+            <table>
+            <tr><th>Order</th><th>제거 성분</th><th>용도</th></tr>
+            <tr><td>1 (Linear)</td><td>Tilt</td><td>OPM Leveling</td></tr>
+            <tr><td>2 (Quadratic)</td><td>Tilt + Bow</td><td>Repeatability 분석</td></tr>
+            <tr><td>3+</td><td>고차 Waviness</td><td>특수 분석</td></tr>
+            </table>
+
+            <p class='note'>Undo/Redo로 이전 상태 복구 가능합니다.</p>
+            """),
+
+            ("5. Saturation Trend", f"""{s}
+            <h2>Saturation Trend</h2>
+            <p>Repeat 수 증가에 따른 Rep. 1σ Mean 추이를 보여줍니다.</p>
+
+            <h3>읽는 방법</h3>
+            <ul>
+            <li>그래프가 <b>수렴</b>하면 현재 Repeat 수가 충분합니다.</li>
+            <li>아직 하강 추세이면 Repeat를 더 늘려야 합니다.</li>
+            <li>초기 값이 매우 높다가 급감하는 경우, 첫 Repeat에 이상이 있을 수 있습니다.</li>
+            </ul>
+
+            <h3>판단 기준</h3>
+            <ul>
+            <li><b>안정화 도달</b>: 마지막 3~4개 Window에서 값 변동 &lt; 10%</li>
+            <li><b>추가 Repeat 필요</b>: 여전히 하강 중이거나 변동폭이 큰 경우</li>
+            </ul>
+            """),
+
+            ("6. Wafer Map", f"""{s}
+            <h2>Wafer Map</h2>
+            <p>3×3 Grid로 각 Position의 OPM Max를 Heatmap으로 표시합니다.</p>
+
+            <h3>색상 해석</h3>
+            <ul>
+            <li><b style='color:#f38ba8'>빨간색</b>: 높은 값 (편차 큼) → 해당 위치 점검 필요</li>
+            <li><b style='color:#a6e3a1'>녹색</b>: 낮은 값 (편차 작음) → 양호</li>
+            </ul>
+
+            <h3>패턴 분석</h3>
+            <ul>
+            <li>특정 영역에 빨간색이 몰려있으면 Stage의 기계적 문제를 의심합니다.</li>
+            <li>Edge vs Center 편차가 크면 Stage Flatness 점검이 필요합니다.</li>
+            <li>비대칭 패턴은 Stage 정렬(Alignment) 문제를 시사합니다.</li>
+            </ul>
+            """),
+
+            ("7. Best-5 Window", f"""{s}
+            <h2>Best-5 Window</h2>
+            <p>연속된 5개(기본) Repeat 구간 중 최적 구간을 찾습니다.</p>
+
+            <h3>선정 기준</h3>
+            <ul>
+            <li><b>Rep. 1σ Mean이 최소</b>인 연속 구간</li>
+            <li>좌측 패널의 <b>Window Size</b>를 변경하면 즉시 재분석됩니다.</li>
+            </ul>
+
+            <h3>그래프 해석</h3>
+            <ul>
+            <li>그래프: Best Window vs All Repeats의 Position별 비교</li>
+            <li>Best Window의 Rep. Max / 1σ가 전체보다 작으면 초기 불안정 Repeat가 있었음을 의미합니다.</li>
+            </ul>
+
+            <h3>활용</h3>
+            <p>Spec 판정은 Best-5 Window 기준으로 수행됩니다.
+            이를 통해 장비 안정화 전 초기 측정의 영향을 배제합니다.</p>
+            """),
+
+            ("8. Time Analysis", f"""{s}
+            <h2>Time Analysis</h2>
+            <p>측정 소요 시간을 분석합니다.</p>
+
+            <h3>표시 항목</h3>
+            <ul>
+            <li>Repeat별 Start / End / Duration 및 포인트당 소요 시간</li>
+            <li>연속 측정 여부 확인 (Gap 2분 이상이면 중단이 있었음)</li>
+            </ul>
+
+            <h3>시간 추정</h3>
+            <ul>
+            <li>하단에서 N-repeat에 필요한 <b>예상 소요 시간</b>을 추정합니다.</li>
+            <li class='note'>공수 반영 시 활용: 10-repeat는 약 2배, 20-repeat는 약 4배 소요</li>
+            </ul>
+            """),
+
+            ("9. Ball Screw Pitch", f"""{s}
+            <h2>Ball Screw Pitch</h2>
+            <p>Sliding Stage Ball Screw의 Pitch 편차를 분석합니다.</p>
+
+            <h3>사용 방법</h3>
+            <ul>
+            <li><b>Material</b> 선택 (AL / SUS) → Ball Screw 재질에 따른 기준 Pitch 변경</li>
+            <li><b>Exclude Stabilization</b> 체크 → Point 1 (안정화 측정) 제외</li>
+            <li><b>Analyze</b> 클릭 → 분석 실행</li>
+            </ul>
+
+            <h3>결과 해석</h3>
+            <ul>
+            <li><b>Bar Chart</b>: Position별 Pitch 편차 분포</li>
+            <li><b>Heatmap</b>: Position × Repeat 매트릭스</li>
+            <li><b>Verdict</b>: 기준 이내면 PASS, 초과 시 FAIL</li>
+            </ul>
+            """),
+
+            ("10. Resolution Compare", f"""{s}
+            <h2>Resolution Compare</h2>
+            <p>서로 다른 Scan Range(25/10/5/1mm)의 OPM을 <b>공정하게</b> 비교하기 위한 기능입니다.</p>
+
+            <h3>왜 필요한가?</h3>
+            <p>모든 Range는 동일하게 <b>8192 pixels</b>로 측정되지만, 스캔 범위가 다르므로
+            픽셀당 해상도(nm/px)가 크게 달라집니다:</p>
+            <table>
+            <tr><th>Range</th><th>Scan Size</th><th>Pixels</th><th>Resolution</th></tr>
+            <tr><td>25mm</td><td>25,000 µm</td><td>8,192</td><td><b>3,052 nm/px</b></td></tr>
+            <tr><td>10mm</td><td>10,000 µm</td><td>8,192</td><td><b>1,221 nm/px</b></td></tr>
+            <tr><td>5mm</td><td>5,000 µm</td><td>8,192</td><td><b>610 nm/px</b></td></tr>
+            <tr><td>1mm</td><td>1,000 µm</td><td>8,192</td><td><b>122 nm/px</b></td></tr>
+            </table>
+            <p>해상도가 높을수록(1mm) 미세한 요철이 더 잘 보이므로 OPM이 자연스럽게 높아집니다.
+            따라서 <b>Range 간 OPM을 단순 비교하면 불공평</b>합니다.</p>
+
+            <h3>정규화 원리</h3>
+            <ul>
+            <li>가장 낮은 해상도(25mm의 3,052 nm/px)를 기준으로 선택</li>
+            <li>고해상도 프로파일을 <b>Block Averaging</b>으로 다운샘플링하여 동일 해상도로 맞춤</li>
+            <li>예: 1mm(122nm/px) → factor 25 → 8192÷25 ≈ 328 pixels로 축소</li>
+            <li>축소된 프로파일에서 OPM을 다시 계산 → <b>Normalized OPM</b></li>
+            </ul>
+
+            <h3>차트 읽는 방법</h3>
+            <ul>
+            <li><b>좌측 (Original OPM)</b>: 실제 측정 해상도 그대로의 OPM Max</li>
+            <li><b>우측 (Normalized OPM)</b>: 동일 해상도(3,052 nm/px)로 정규화한 OPM Max</li>
+            </ul>
+
+            <h3>결과 해석</h3>
+            <table>
+            <tr><th>현상</th><th>의미</th></tr>
+            <tr><td>정규화 후 1mm OPM이 <b>크게 감소</b></td>
+                <td>원래 높았던 이유는 <b>고해상도 효과</b> → Stage 자체는 양호</td></tr>
+            <tr><td>정규화 후에도 1mm OPM이 <b>여전히 높음</b></td>
+                <td><b>실제 Stage 문제</b>일 가능성 → 추가 점검 필요</td></tr>
+            <tr><td>모든 Range의 Normalized OPM이 <b>비슷</b></td>
+                <td>Stage 성능이 전 Range에서 균일 → 이상적인 상태</td></tr>
+            </table>
+
+            <p class='note'>⚠ 데이터 루트 폴더(2개 이상 Range 포함)를 로드해야 차트가 표시됩니다.
+            단일 Range만 로드하면 비교 대상이 없으므로 빈 상태가 유지됩니다.</p>
+            """),
+
+            ("11. QC Check", f"""{s}
+            <h2>QC Check — Data Collection Quality Control</h2>
+            <p>측정 데이터의 무결성을 6개 항목으로 자동 검증합니다.</p>
+
+            <h3>사용 방법</h3>
+            <ul>
+            <li>1. 데이터 로드 후 <b>QC Check</b> 탭 선택</li>
+            <li>2. <b>Run QC</b> 버튼 클릭</li>
+            <li>3. Summary 패널에서 6개 항목의 PASS / WARN / FAIL 확인</li>
+            <li>4. Detail ComboBox에서 항목 선택 → 상세 결과 테이블 확인</li>
+            </ul>
+
+            <h3>검사 항목</h3>
+            <table>
+            <tr><th>항목</th><th>검증 내용</th><th>검출 사례</th></tr>
+            <tr><td><b>QC-1: File Matching</b></td>
+                <td>Recipe TIFF와 Raw TIFF 파일 1:1 매칭</td>
+                <td>저장 오류, 디스크 용량 부족</td></tr>
+            <tr><td><b>QC-2: Data Equivalence</b></td>
+                <td>Order-2 Flatten 후 분석 결과 동일성</td>
+                <td>파일 손상, Recipe 설정 오류</td></tr>
+            <tr><td><b>QC-3: Scan Parameters</b></td>
+                <td>Z Sensitivity, Scan Size 등 일관성</td>
+                <td>Recipe 변경 후 부분 재측정</td></tr>
+            <tr><td><b>QC-4: Position Completeness</b></td>
+                <td>9개 Position × N Repeat 완전성</td>
+                <td>측정 중단, 팁 파손</td></tr>
+            <tr><td><b>QC-5: Outlier Detection</b></td>
+                <td>Median ± 3×MAD 기준 이상치 탐지</td>
+                <td>Stage 진동, 팁 오염</td></tr>
+            <tr><td><b>QC-6: Pixel Count</b></td>
+                <td>프로파일 데이터 포인트 수 (8192)</td>
+                <td>비정상 종료, 파일 손상</td></tr>
+            </table>
+
+            <h3>판정 기준</h3>
+            <ul>
+            <li><span class='pass'>PASS</span>: 모든 항목 정상 — 데이터 신뢰 가능</li>
+            <li><span class='warn'>WARN</span>: 이상치 감지 등 주의 필요 — 데이터 사용 가능하나 확인 권장</li>
+            <li><span class='fail'>FAIL</span>: 데이터 무결성 문제 — 원인 확인 후 재측정 고려</li>
+            </ul>
+
+            <h3>QC-5 Outlier Detection 상세</h3>
+            <p>MAD(Median Absolute Deviation) 기반 이상치 탐지를 사용합니다.</p>
+            <ul>
+            <li><b>기준</b>: |OPM - Median| > 3 × 1.4826 × MAD</li>
+            <li>1.4826은 MAD를 정규분포 σ와 일관되게 하는 보정 계수입니다.</li>
+            <li>Repeat 3회 미만 시 탐지를 스킵합니다.</li>
+            </ul>
+
+            <h3>Overall 판정</h3>
+            <ul>
+            <li>6개 항목 중 하나라도 <span class='fail'>FAIL</span>이면 Overall = <span class='fail'>FAIL</span></li>
+            <li>FAIL 없이 <span class='warn'>WARN</span>이 있으면 Overall = <span class='warn'>WARN</span></li>
+            <li>모두 <span class='pass'>PASS</span>이면 Overall = <span class='pass'>PASS</span></li>
+            </ul>
+            """),
+
+            ("12. Compare", f"""{s}
+            <h2>Compare — Cross-Process Comparison</h2>
+            <p>동일 모듈의 다른 공정(모듈 조립 vs 완제품) 테스트 결과를 비교합니다.</p>
+
+            <h3>사용 방법</h3>
+            <ul>
+            <li>1. 현재 데이터를 먼저 로드 (Open Folder)</li>
+            <li>2. Compare 탭에서 <b>Load Reference</b> 클릭</li>
+            <li>3. 비교 대상 데이터 폴더 선택</li>
+            <li>4. Position별 Δ(차이) 테이블 자동 표시</li>
+            </ul>
+
+            <h3>테이블 해석</h3>
+            <table>
+            <tr><th>열</th><th>의미</th></tr>
+            <tr><td>Curr OPM Max</td><td>현재 데이터 OPM Max</td></tr>
+            <tr><td>Ref OPM Max</td><td>Reference 데이터 OPM Max</td></tr>
+            <tr><td>Δ OPM (nm)</td><td>차이값 (빨강=악화, 초록=개선)</td></tr>
+            <tr><td>Δ OPM (%)</td><td>변화율</td></tr>
+            </table>
+
+            <h3>활용</h3>
+            <ul>
+            <li>모듈 조립 → 완제품 간 OPM 변화 추적</li>
+            <li>Edge/Side/Center 그룹별 변화 패턴 분석</li>
+            <li>특정 Position에서 큰 편차 → 조립 공정 문제 시사</li>
+            </ul>
+            """),
+
+            ("Spec Judgment", f"""{s}
+            <h2>Spec Judgment (좌측 패널)</h2>
+            <p>장비 타입에 따라 다른 기준으로 PASS/FAIL을 판단합니다.</p>
+
+            <h3>장비 타입별 판정 기준</h3>
+            <table>
+            <tr><th>타입</th><th>OPM Repeatability 기준</th><th>Max OPM 기준</th></tr>
+            <tr><td><b>분리형 (Isolated AE)</b></td>
+                <td>Total RMS of Rep. 1σ</td><td>Total Max of OPM Max</td></tr>
+            <tr><td><b>일체형 (Double Walled AE)</b></td>
+                <td>Center(5_CM) Rep. 1σ</td><td>Center(5_CM) OPM Max</td></tr>
+            </table>
+
+            <h3>Spec 한도 (OPM Repeatability)</h3>
+            <table>
+            <tr><th>Range</th><th>한도 (nm)</th></tr>
+            <tr><td>25 mm</td><td>12.9</td></tr>
+            <tr><td>10 mm</td><td>5.6</td></tr>
+            <tr><td>5 mm</td><td>3.3</td></tr>
+            <tr><td>1 mm</td><td>1.6</td></tr>
+            </table>
+
+            <h3>합격 조건</h3>
+            <ul>
+            <li>OPM Repeatability + Max OPM <b>두 항목 모두 PASS</b>해야 합격</li>
+            <li><b>?</b> 버튼을 클릭하면 전체 Spec 테이블을 확인할 수 있습니다.</li>
+            </ul>
+            """),
+        ]
 
     # ─── Data Loading ────────────────────────────────────────
 
@@ -1016,14 +1924,24 @@ class MainWindow(QMainWindow):
 
         self._update_summary_table()
         self._update_spec_display()
+        self._update_scan_info()
+        self._update_res_slider_range()
         self._update_profile_chart()
         self._update_trend_chart()
         self._update_wafer_map()
         self._update_best5_chart()
         self._update_time_tab()
+        self._update_resolution_compare()
+
         # Reset Ball Screw result when recipe changes (requires explicit Analyze click)
         self.current_bs_result = None
         self._clear_bs_tab()
+        # Reset QC result (requires explicit Run QC click)
+        self.current_qc_result = None
+        self._clear_qc_tab()
+        # Reset Compare result
+        self.current_compare_result = None
+        self._clear_compare_tab()
 
         self.export_btn.setEnabled(True)
 
@@ -1087,6 +2005,10 @@ class MainWindow(QMainWindow):
                 if row.get("Range") == "Total":
                     item.setBackground(QColor("#313244"))
                     item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                elif row.get("Range") == "Group":
+                    item.setBackground(QColor("#1e1e2e"))
+                    item.setForeground(QColor("#f9e2af"))
+                    item.setFont(QFont("Segoe UI", 11, QFont.Bold))
                 self.summary_table.setItem(i, j, item)
 
     def _update_spec_display(self):
@@ -1136,10 +2058,102 @@ class MainWindow(QMainWindow):
             self.spec_verdict_label.setStyleSheet(
                 "font-size: 18px; font-weight: bold; padding: 4px;")
 
+    def _update_scan_info(self):
+        """Update Scan Parameters panel from current recipe."""
+        if not self.current_recipe or not self.current_recipe.repeats:
+            self.scan_info_label.setText("—")
+            return
+
+        repeat = self.current_recipe.repeats[0]
+        recipe_name = getattr(repeat, 'recipe_id', '') or ''
+        # Extract short recipe name (last segment of path)
+        if '\\' in recipe_name:
+            recipe_name = recipe_name.rsplit('\\', 1)[-1]
+
+        # Get scan params from first available profile
+        profile = None
+        for pos in POSITION_LABELS:
+            if pos in repeat.profiles:
+                profile = repeat.profiles[pos]
+                break
+
+        if profile is None:
+            self.scan_info_label.setText(f"<b>Recipe:</b> {recipe_name}")
+            return
+
+        px_count = len(profile.raw_data)
+        res_nm = profile.scan_size_um * 1000 / px_count if px_count > 0 else 0
+
+        lines = [
+            f"<b>Recipe:</b> {recipe_name}",
+            f"<b>Size:</b> {profile.scan_size_um:.0f} µm &nbsp; "
+            f"<b>Px:</b> {px_count}",
+            f"<b>Resolution:</b> {res_nm:.1f} nm/px",
+            f"<b>Speed:</b> {profile.scan_speed_mm_s:.3f} mm/s &nbsp; "
+            f"<b>SP:</b> {profile.set_point:.1f}",
+            f"<b>Z Gain:</b> {profile.z_servo_gain:.1f}",
+        ]
+        self.scan_info_label.setText("<br>".join(lines))
+
+    def _get_scan_info_dict(self) -> dict:
+        """Get scan info dict for chart suptitle."""
+        if not self.current_recipe or not self.current_recipe.repeats:
+            return {}
+        repeat = self.current_recipe.repeats[0]
+        for pos in POSITION_LABELS:
+            if pos in repeat.profiles:
+                p = repeat.profiles[pos]
+                px_count = len(p.raw_data)
+                return {
+                    "range_label": self.current_recipe.range_label,
+                    "pixels": px_count,
+                    "resolution_nm": p.scan_size_um * 1000 / px_count if px_count else 0,
+                    "speed": p.scan_speed_mm_s,
+                    "set_point": p.set_point,
+                }
+        return {}
+
+    def _on_res_slider_changed(self, value):
+        """Update label and refresh profile chart when resolution slider changes."""
+        if not self.current_recipe:
+            return
+        if value <= 1:
+            self.res_slider_label.setText("Original")
+        else:
+            # Compute simulated resolution
+            scan_info = self._get_scan_info_dict()
+            orig_res = scan_info.get("resolution_nm", 0)
+            sim_res = orig_res * value
+            self.res_slider_label.setText(f"{sim_res:.0f} nm/px (×{value})")
+        self._update_profile_chart()
+
+    def _update_res_slider_range(self):
+        """Update resolution slider range based on current recipe."""
+        if not self.current_recipe:
+            return
+        scan_info = self._get_scan_info_dict()
+        orig_res = scan_info.get("resolution_nm", 0)
+        if orig_res <= 0:
+            return
+        # Max factor: simulate up to ~3052 nm/px (25mm equivalent)
+        max_factor = max(1, int(3052 / orig_res))
+        self.res_slider.blockSignals(True)
+        self.res_slider.setMinimum(1)
+        self.res_slider.setMaximum(max_factor)
+        self.res_slider.setValue(1)
+        self.res_slider.blockSignals(False)
+        self.res_slider_label.setText("Original")
+
     def _update_profile_chart(self):
         if not self.current_recipe:
             return
-        fig = create_profile_overlay_figure(self.current_recipe, figsize=(12, 9))
+        scan_info = self._get_scan_info_dict()
+        y_mode = self.y_scale_combo.currentText().lower()
+        sim_factor = self.res_slider.value()
+        fig = create_profile_overlay_figure(self.current_recipe, figsize=(12, 9),
+                                            scan_info=scan_info,
+                                            y_scale_mode=y_mode,
+                                            sim_factor=sim_factor)
         self._update_canvas(self.profile_canvas, fig)
 
         # Store axes → position mapping for double-click

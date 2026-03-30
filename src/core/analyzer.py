@@ -18,6 +18,14 @@ from typing import Optional
 import numpy as np
 
 from .data_loader import RecipeData, POSITION_LABELS
+from .flatten import polynomial_flatten
+
+# Position group definitions for Edge/Center/Side analysis
+POSITION_GROUPS = {
+    "Center": ["5_CM"],
+    "Side":   ["2_CT", "4_LM", "6_RM", "8_CB"],
+    "Edge":   ["1_LT", "3_RT", "7_LB", "9_RB"],
+}
 
 
 # Spec limits (nm) - OPM Repeatability
@@ -118,22 +126,28 @@ class AnalysisResult:
 
 
 def _compute_position_result(position: str,
-                              profiles_z: list[np.ndarray],
-                              opm_per_repeat: list[float]) -> PositionResult:
+                              profiles_z_flat2: list[np.ndarray],
+                              opm_leveled: list[float]) -> PositionResult:
     """Compute statistics for one position across repeats.
 
     Metrics:
-        - Rep. Max: Max of pixel-wise range across repeats (repeatability)
+        - Rep. Max: Max of pixel-wise range across repeats
+                    (computed on Order-2 flattened profiles)
         - Rep. 1σ:  Stdev of pixel-wise range across repeats
-        - OPM Max:  Max of per-profile Range (Max-Min) values
-        - OPM 1σ:   Stdev of per-profile Range values
-    """
-    opm_arr = np.array(opm_per_repeat, dtype=np.float64)
+        - OPM Max:  Max of per-profile OPM values
+                    (computed on Order-1 leveled profiles)
+        - OPM 1σ:   Stdev of per-profile OPM values
 
-    # Pixel-wise repeatability: for each pixel, compute range across repeats
-    if len(profiles_z) >= 2:
-        stack = np.array(profiles_z, dtype=np.float64)  # (repeats, pixels)
-        pixel_range = stack.max(axis=0) - stack.min(axis=0)  # (pixels,)
+    Args:
+        profiles_z_flat2: List of Order-2 flattened Z arrays (one per repeat).
+        opm_leveled: List of OPM (Max-Min) values from Order-1 leveled profiles.
+    """
+    opm_arr = np.array(opm_leveled, dtype=np.float64)
+
+    # Pixel-wise repeatability on Order-2 flattened profiles
+    if len(profiles_z_flat2) >= 2:
+        stack = np.array(profiles_z_flat2, dtype=np.float64)  # (repeats, pixels)
+        pixel_range = stack.max(axis=0) - stack.min(axis=0)   # (pixels,)
         rep_max = float(pixel_range.max())
         rep_1sigma = float(pixel_range.std(ddof=0))
     else:
@@ -147,7 +161,7 @@ def _compute_position_result(position: str,
         rep_1sigma=rep_1sigma,
         opm_max=float(opm_arr.max()),
         opm_1sigma=float(opm_arr.std(ddof=0)),
-        repeat_count=len(opm_per_repeat),
+        repeat_count=len(opm_leveled),
     )
 
 
@@ -161,16 +175,19 @@ def _evaluate_window(recipe: RecipeData, start: int, count: int) -> Optional[Win
     positions = {}
 
     for pos in POSITION_LABELS:
-        opm_values = []
-        profiles_z = []
+        opm_leveled = []
+        profiles_z_flat2 = []
         for repeat in window_repeats:
             if pos in repeat.profiles:
-                profile = repeat.profiles[pos]
-                opm_values.append(profile.opm_nm)
-                profiles_z.append(profile.z_nm)
+                z_raw = repeat.profiles[pos].z_nm
+                # Order-2 flatten for Rep. Max / Rep. 1σ
+                profiles_z_flat2.append(polynomial_flatten(z_raw, order=2))
+                # Order-1 leveling for OPM Max / OPM 1σ
+                z_lev = polynomial_flatten(z_raw, order=1)
+                opm_leveled.append(float(z_lev.max() - z_lev.min()))
 
-        if opm_values:
-            positions[pos] = _compute_position_result(pos, profiles_z, opm_values)
+        if opm_leveled:
+            positions[pos] = _compute_position_result(pos, profiles_z_flat2, opm_leveled)
 
     if not positions:
         return None
@@ -207,15 +224,19 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5,
     # --- Compute ALL-repeat statistics per position ---
     all_positions = {}
     for pos in POSITION_LABELS:
-        opm_values = []
-        profiles_z = []
+        opm_leveled = []
+        profiles_z_flat2 = []
         for repeat in recipe.repeats:
             if pos in repeat.profiles:
-                opm_values.append(repeat.profiles[pos].opm_nm)
-                profiles_z.append(repeat.profiles[pos].z_nm)
+                z_raw = repeat.profiles[pos].z_nm
+                # Order-2 flatten for Rep. Max / Rep. 1σ
+                profiles_z_flat2.append(polynomial_flatten(z_raw, order=2))
+                # Order-1 leveling for OPM Max / OPM 1σ
+                z_lev = polynomial_flatten(z_raw, order=1)
+                opm_leveled.append(float(z_lev.max() - z_lev.min()))
 
-        if opm_values:
-            all_positions[pos] = _compute_position_result(pos, profiles_z, opm_values)
+        if opm_leveled:
+            all_positions[pos] = _compute_position_result(pos, profiles_z_flat2, opm_leveled)
 
     # --- Evaluate ALL sliding windows ---
     all_windows = []
@@ -317,12 +338,31 @@ def get_summary_table(result: AnalysisResult,
                 "OPM 1σ (nm)": round(p.opm_1sigma, 3),
             })
 
+    # Position group rows (Edge / Side / Center)
+    if rows:
+        for group_name in ["Center", "Side", "Edge"]:
+            group_positions = POSITION_GROUPS[group_name]
+            group_rows = [r for r in rows if r["Position"] in group_positions]
+            if group_rows:
+                g_rep_max = [r["Rep. Max (nm)"] for r in group_rows]
+                g_rep_sig = [r["Rep. 1σ (nm)"] for r in group_rows]
+                g_opm_max = [r["OPM Max (nm)"] for r in group_rows]
+                g_opm_sig = [r["OPM 1σ (nm)"] for r in group_rows]
+                rows.append({
+                    "Range": "Group", "Position": group_name,
+                    "Rep. Max (nm)": round(float(np.mean(g_rep_max)), 3),
+                    "Rep. 1σ (nm)": round(float(np.mean(g_rep_sig)), 3),
+                    "OPM Max (nm)": round(float(max(g_opm_max)), 3),
+                    "OPM 1σ (nm)": round(float(np.mean(g_opm_sig)), 3),
+                })
+
     # Total row
     if rows:
-        rep_maxes = [r["Rep. Max (nm)"] for r in rows]
-        rep_sigmas = [r["Rep. 1σ (nm)"] for r in rows]
-        opm_maxes = [r["OPM Max (nm)"] for r in rows]
-        opm_sigmas = [r["OPM 1σ (nm)"] for r in rows]
+        pos_rows = [r for r in rows if r["Range"] != "Group"]
+        rep_maxes = [r["Rep. Max (nm)"] for r in pos_rows]
+        rep_sigmas = [r["Rep. 1σ (nm)"] for r in pos_rows]
+        opm_maxes = [r["OPM Max (nm)"] for r in pos_rows]
+        opm_sigmas = [r["OPM 1σ (nm)"] for r in pos_rows]
 
         rows.append({"Range": "Total", "Position": "Mean",
                       "Rep. Max (nm)": round(float(np.mean(rep_maxes)), 3),
@@ -348,3 +388,75 @@ def get_summary_table(result: AnalysisResult,
                       "OPM 1σ (nm)": round(float(np.mean(opm_sigmas)), 3)})
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Resolution normalization for cross-range comparison
+# ---------------------------------------------------------------------------
+
+def resample_profile(z_data: np.ndarray, factor: int) -> np.ndarray:
+    """Downsample profile by block averaging.
+
+    Args:
+        z_data: 1D profile array.
+        factor: Downsample factor (e.g., 25 means average every 25 pixels into 1).
+
+    Returns:
+        Downsampled 1D array.
+    """
+    if factor <= 1:
+        return z_data
+    n_new = len(z_data) // factor
+    return z_data[:n_new * factor].reshape(n_new, factor).mean(axis=1)
+
+
+def compute_normalized_opm(recipe: RecipeData,
+                           target_res_nm: float) -> dict[str, dict]:
+    """Compute OPM per position after normalizing to target resolution.
+
+    Args:
+        recipe: RecipeData with loaded profiles.
+        target_res_nm: Target pixel resolution in nm/pixel.
+
+    Returns:
+        dict[position, {"original_opm": float, "normalized_opm": float,
+                         "original_res": float, "factor": int}]
+    """
+    results = {}
+    for pos in POSITION_LABELS:
+        opm_orig_list = []
+        opm_norm_list = []
+        original_res = None
+
+        for repeat in recipe.repeats:
+            if pos not in repeat.profiles:
+                continue
+            prof = repeat.profiles[pos]
+            px_count = len(prof.raw_data)
+            res_nm = prof.scan_size_um * 1000 / px_count if px_count > 0 else 1.0
+            if original_res is None:
+                original_res = res_nm
+
+            # Original OPM (Order-1 leveled)
+            z_lev = polynomial_flatten(prof.z_nm, order=1)
+            opm_orig_list.append(float(z_lev.max() - z_lev.min()))
+
+            # Normalized OPM (resample then level)
+            factor = max(1, int(round(target_res_nm / res_nm)))
+            if factor > 1:
+                z_resampled = resample_profile(prof.z_nm, factor)
+                z_lev_norm = polynomial_flatten(z_resampled, order=1)
+            else:
+                z_lev_norm = z_lev
+            opm_norm_list.append(float(z_lev_norm.max() - z_lev_norm.min()))
+
+        if opm_orig_list:
+            factor = max(1, int(round(target_res_nm / (original_res or 1))))
+            results[pos] = {
+                "original_opm": float(max(opm_orig_list)),
+                "normalized_opm": float(max(opm_norm_list)),
+                "original_res": original_res or 0,
+                "factor": factor,
+            }
+
+    return results

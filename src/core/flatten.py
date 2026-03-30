@@ -191,3 +191,38 @@ def quick_flatten(z_data: np.ndarray, order: int = 1,
     proc = FlattenProcessor(max_history=1)
     result = proc.flatten(z_data, order=order, edge_percent=edge_percent)
     return result.flattened
+
+
+def polynomial_flatten(z_data: np.ndarray,
+                       x_data: Optional[np.ndarray] = None,
+                       order: int = 1) -> np.ndarray:
+    """Lightweight polynomial flatten (no edge exclusion, no history).
+
+    Subtracts an nth-order polynomial regression from the profile.
+    Uses normalized X for numerical stability.
+
+    Args:
+        z_data: Z values in nm (1D array).
+        x_data: X values (optional, auto-generated if None).
+        order: Polynomial order (0 = mean subtraction, 1~12).
+
+    Returns:
+        Flattened Z values (1D array, same length as input).
+    """
+    n = len(z_data)
+    if x_data is None:
+        x_data = np.arange(n, dtype=np.float64)
+
+    if order == 0:
+        return z_data - z_data.mean()
+
+    # Normalize X for numerical stability
+    x_mean = x_data.mean()
+    x_std = x_data.std()
+    if x_std == 0:
+        x_std = 1.0
+    x_norm = (x_data - x_mean) / x_std
+
+    coefficients = np.polyfit(x_norm, z_data, order)
+    regression = np.polyval(coefficients, x_norm)
+    return z_data - regression

@@ -109,27 +109,8 @@ class BallScrewAnalysisResult:
 
 # ─── Core Calculation ──────────────────────────────────────────────────────────
 
-def _polynomial_flatten(z_data: np.ndarray, order: int = 12) -> np.ndarray:
-    """Apply nth-order polynomial flatten to profile data.
-
-    Uses normalized X for numerical stability (same as FlattenProcessor).
-    No edge exclusion (full data used for Ball Screw Pitch analysis).
-    """
-    n = len(z_data)
-    x_data = np.arange(n, dtype=np.float64)
-
-    if order == 0:
-        return z_data - z_data.mean()
-
-    x_mean = x_data.mean()
-    x_std = x_data.std()
-    if x_std == 0:
-        x_std = 1.0
-    x_norm = (x_data - x_mean) / x_std
-
-    coefficients = np.polyfit(x_norm, z_data, order)
-    regression = np.polyval(coefficients, x_norm)
-    return z_data - regression
+# Re-use the shared lightweight flatten from flatten.py
+from .flatten import polynomial_flatten as _polynomial_flatten
 
 
 def compute_dishing(
